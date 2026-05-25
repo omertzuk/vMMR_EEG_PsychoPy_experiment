@@ -650,11 +650,18 @@ def main():
                                            height=TEXT_HEIGHT, color="white",
                                            font=TEXT_FONT, wrapWidth=1000,
                                            units="pix")
-        # Hebrew prime word: languageStyle="RTL" gives correct right-to-left order.
-        prime_stim = visual.TextStim(win, text="", pos=(0, PRIME_Y),
-                                     height=TEXT_HEIGHT, color="white",
-                                     font=TEXT_FONT, languageStyle="RTL",
-                                     units="pix")
+        # Hebrew prime word. The legacy TextStim renderer on Windows crashes on
+        # Hebrew letters that carry niqqud (base letter + combining vowel mark).
+        # TextBox2 has a proper Unicode/RTL renderer and handles this correctly.
+        # Note the API differences: letterHeight (not height), and an explicit
+        # box size + anchor/alignment to keep the word centred at PRIME_Y.
+        prime_stim = visual.TextBox2(win, text="", font=TEXT_FONT,
+                                     pos=(0, PRIME_Y), letterHeight=TEXT_HEIGHT,
+                                     color="white", units="pix",
+                                     size=(1000, 100),
+                                     alignment="center", anchor="center",
+                                     borderColor=None, fillColor=None,
+                                     languageStyle="RTL", editable=False)
         fix_stim = visual.TextStim(win, text="+", pos=(0, 0), height=FIX_HEIGHT,
                                    color="white", font=TEXT_FONT, units="pix")
 
