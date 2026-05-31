@@ -3,8 +3,9 @@
 2. Image morphing algo - morphing, brightness adjusting, 
 
 # Triggers
-1. LSL wrapper
-2. Photodiode stuff
+Photodiode stuff - done in script, validate hardware
 
-Triggers:
+
+# Saving
+Think about BIDS-compatible saving
 
