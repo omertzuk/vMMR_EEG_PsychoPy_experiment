@@ -20,6 +20,7 @@
 from psychopy import visual, core, gui, logging
 from psychopy import event as psychopy_event
 from psychopy.hardware import keyboard
+import pyglet
 
 # psychopy.parallel may be unavailable on machines with no parallel port
 # (e.g. when developing on a laptop). Import defensively so dry runs still work.
@@ -33,7 +34,6 @@ from datetime import datetime
 import traceback
 import csv
 import random
-import unicodedata
 
 # =============================================================================
 # 1. CONSTANTS  -- all timings come straight from the paper's Methods section
@@ -161,11 +161,6 @@ def clean_hebrew_for_display(value):
     ]
     for ch in control_chars:
         s = s.replace(ch, "")
-
-    # Remove Hebrew niqqud / combining marks.
-    # This is safest for experimental display unless you explicitly need niqqud.
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
     return s.strip()
 
@@ -620,6 +615,12 @@ def main():
     data_dir        = root / "data"
     data_dir.mkdir(exist_ok=True)
 
+    # Register the bundled Noto Sans Hebrew font so PsychoPy's TextBox2 renderer
+    # (which uses pyglet) can find it by family name without a system install.
+    _font_file = root / "fonts" / "static" / "NotoSansHebrew-Regular.ttf"
+    if _font_file.exists():
+        pyglet.font.add_file(str(_font_file))
+
     # --- startup dialog ------------------------------------------------------
     # Boolean values render as checkboxes in the dialog.
     exp_info = {
@@ -653,7 +654,7 @@ def main():
     # --- load trial tables (before opening the window, so errors show early) -
     practice_rows = read_trials(conditions_dir / "practice_trials.csv")
     main_rows     = read_trials(conditions_dir / "main_trials.csv")
-    all_rows      = practice_rows + main_rows
+    all_rows      = practice_rows # + main_rows
 
     event_writer, event_f = make_event_writer(str(base) + "_events.csv")
     trial_writer, trial_f = make_trial_writer(str(base) + "_trials.csv")
