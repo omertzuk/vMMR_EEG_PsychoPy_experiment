@@ -20,13 +20,20 @@
 from psychopy import visual, core, gui, logging
 from psychopy import event as psychopy_event
 from psychopy.hardware import keyboard
-from lsl_trigger import LSLTrigger
+
+# psychopy.parallel may be unavailable on machines with no parallel port
+# (e.g. when developing on a laptop). Import defensively so dry runs still work.
+try:
+    from psychopy import parallel
+except Exception:
+    parallel = None
 
 from pathlib import Path
 from datetime import datetime
 import traceback
 import csv
 import random
+import unicodedata
 
 # =============================================================================
 # 1. CONSTANTS  -- all timings come straight from the paper's Methods section
@@ -56,12 +63,12 @@ FACE_SIZE   = (425, 405)   # matches the paper's face images
 PRIME_Y     = 260          # prime word sits above the face
 TEXT_HEIGHT = 34
 FIX_HEIGHT  = 42
-TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
+# TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
 # TEXT_FONT = "Tahoma"
 # TEXT_FONT = "Narkisim"
 # TEXT_FONT = "Miriam"
 # TEXT_FONT = "Segoe UI"
-# TEXT_FONT = "Gisha"
+TEXT_FONT = "Noto Sans Hebrew"
 
 # --- Photodiode timing marker -----------------------------------------------
 # The square is only a visible luminance event on the monitor. The external
@@ -105,14 +112,6 @@ TRIGGER_MAP = {
     ("NEGATIVE", "OTHER", "DEV"):        42,
     ("NEGATIVE", "OTHER", "TARGET_STD"): 43,
     ("NEGATIVE", "OTHER", "TARGET_DEV"): 44,
-}
-
-# Sent on the first frame the Hebrew prime word appears (600 ms before faces).
-PRIME_ONSET_TRIGGER = {
-    ("DEATH",    "SELF"):  51,
-    ("DEATH",    "OTHER"): 52,
-    ("NEGATIVE", "SELF"):  61,
-    ("NEGATIVE", "OTHER"): 62,
 }
 
 
@@ -178,6 +177,11 @@ def clean_hebrew_for_display(value):
     ]
     for ch in control_chars:
         s = s.replace(ch, "")
+
+    # Remove Hebrew niqqud / combining marks.
+    # This is safest for experimental display unless you explicitly need niqqud.
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
     return s.strip()
 
@@ -263,8 +267,31 @@ def build_face_sequence(trial_row):
 # =============================================================================
 # 6. EEG TRIGGER HARDWARE WRAPPER
 # =============================================================================
-# LSLTrigger (imported from lsl_trigger.py) replaces the old parallel-port
-# EEGTrigger. Interface is identical: .set(code) / .clear() / .stop().
+
+class EEGTrigger:
+    """Thin wrapper around the parallel port. When disabled, every call is a
+    no-op, so the exact same code runs during a no-hardware dry run."""
+
+    def __init__(self, enabled=False, address="0x0378"):
+        self.enabled = enabled
+        self.port = None
+        if not self.enabled:
+            return
+        if parallel is None:
+            raise RuntimeError("EEG triggers requested but psychopy.parallel "
+                               "is unavailable on this machine.")
+        addr = str(address).strip()
+        addr_int = int(addr, 16) if addr.lower().startswith("0x") else int(addr)
+        self.port = parallel.ParallelPort(address=addr_int)
+        self.port.setData(0)                 # ensure all lines start low
+
+    def set(self, code):
+        if self.port is not None:
+            self.port.setData(int(code))
+
+    def clear(self):
+        if self.port is not None:
+            self.port.setData(0)
 
 
 # =============================================================================
@@ -348,7 +375,7 @@ def check_escape():
     if psychopy_event.getKeys(keyList=[QUIT_KEY]):
         raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
     
-def collect_presses(kb, presses, trigger=None):
+def collect_presses(kb, presses):
     """
     Drain the keyboard buffer once. Each response key is appended to `presses`
     as (name, rt), where rt is on the keyboard clock that was reset at the start
@@ -366,8 +393,6 @@ def collect_presses(kb, presses, trigger=None):
         if k.name == QUIT_KEY:
             raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
         if k.name in RESPONSE_KEYS:
-            if trigger is not None:
-                trigger.set(90)            # participant button press
             presses.append((k.name, k.rt))
 
 # =============================================================================
@@ -425,19 +450,14 @@ def show_text_and_wait(win, kb, text_stim, message,
                     return
 
 
-def present_static(win, kb, draw_list, n_frames, presses,
-                   trigger=None, onset_code=None):
+def present_static(win, kb, draw_list, n_frames, presses):
     """Draw a fixed set of stimuli for n_frames, collecting keypresses every
-    frame. Covers the fixation, prime, pre-face-fix and post-sequence periods.
-    If onset_code is given, sends that trigger on the first flip via callOnFlip
-    (frame-precise, same mechanism as face-onset triggers)."""
-    for frame_n in range(n_frames):
+    frame. Covers the fixation, prime, pre-face-fix and post-sequence periods."""
+    for _ in range(n_frames):
         for stim in draw_list:
             stim.draw()
-        if frame_n == 0 and trigger is not None and onset_code is not None:
-            win.callOnFlip(trigger.set, onset_code)
         win.flip()
-        collect_presses(kb, presses, trigger)
+        collect_presses(kb, presses)
 
 
 # =============================================================================
@@ -467,7 +487,7 @@ def present_face_event(win, kb, prime_stim, image_stim, diode_stim,
 
     # ----- face ON (prime + face) --------------------------------------------
     # If enabled, the photodiode square appears on the exact same flip as the
-    # face. The ordinary PsychoPy/LSL trigger remains the condition label; the
+    # face. The ordinary PsychoPy trigger remains the condition label; the
     # optical channel should be used later to align EEG to true visual onset.
     for frame_n in range(face_on_frames):
         prime_stim.draw()
@@ -480,13 +500,13 @@ def present_face_event(win, kb, prime_stim, image_stim, diode_stim,
         if frame_n == 1:                   # second frame: clear the 1-frame pulse
             win.callOnFlip(trigger.clear)
         win.flip()
-        collect_presses(kb, presses, trigger)
+        collect_presses(kb, presses)
 
     # ----- face OFF (prime alone) --------------------------------------------
     for _ in range(blank_frames):
         prime_stim.draw()
         win.flip()
-        collect_presses(kb, presses, trigger)
+        collect_presses(kb, presses)
 
     return onset["global"], onset["trial"]
 
@@ -634,17 +654,14 @@ def run_trial(row, phase, participant, session, trial_global,
     # --- 1) trial-start fixation: cross only, jittered 500-700 ms ------------
     fix_frames = max(1, int(round(random.uniform(FIX_MIN, FIX_MAX)
                                   * frame_counts["rate"])))
-    present_static(win, kb, [fix_stim], fix_frames, presses,
-                   trigger=trigger, onset_code=80)
+    present_static(win, kb, [fix_stim], fix_frames, presses)
 
     # --- 2) prime word alone, 600 ms ----------------------------------------
-    prime_onset_code = PRIME_ONSET_TRIGGER[(prime_type, identity)]
-    present_static(win, kb, [prime_stim], frame_counts["prime"], presses,
-                   trigger=trigger, onset_code=prime_onset_code)
+    present_static(win, kb, [prime_stim], frame_counts["prime"], presses)
 
     # --- 3) prime word + central cross, 250 ms ------------------------------
     present_static(win, kb, [prime_stim, fix_stim],
-                   frame_counts["pre_face"], presses, trigger=trigger)
+                   frame_counts["pre_face"], presses)
 
     # --- 4) the face sequence ------------------------------------------------
     target_onset = None
@@ -685,8 +702,7 @@ def run_trial(row, phase, participant, session, trial_global,
         event_f.flush()
 
     # --- 5) post-sequence window: prime word stays, catches late hits --------
-    present_static(win, kb, [prime_stim], frame_counts["post_seq"], presses,
-                   trigger=trigger)
+    present_static(win, kb, [prime_stim], frame_counts["post_seq"], presses)
 
     win.recordFrameIntervals = False
 
@@ -723,13 +739,15 @@ def main():
         "participant": "test001",
         "session": "001",
         "fullscreen": False,
-        "send_LSL_triggers": False,
+        "send_EEG_triggers": False,
+        "parallel_port_address": "0x0378",
         "photodiode_square": False,
         "photodiode_test_mode": False,
     }
     dlg = gui.DlgFromDict(exp_info, title="vMMR EEG experiment",
                           order=["participant", "session", "fullscreen",
-                                 "send_LSL_triggers", "photodiode_square",
+                                 "send_EEG_triggers", "parallel_port_address",
+                                 "photodiode_square",
                                  "photodiode_test_mode"])
     if not dlg.OK:
         core.quit()
@@ -737,10 +755,9 @@ def main():
     participant       = exp_info["participant"]
     session           = exp_info["session"]
     fullscreen        = bool(exp_info["fullscreen"])
-    send_lsl_triggers = bool(exp_info["send_LSL_triggers"])
+    send_eeg_triggers = bool(exp_info["send_EEG_triggers"])
     use_photodiode_square = bool(exp_info["photodiode_square"])
     photodiode_test_mode  = bool(exp_info["photodiode_test_mode"])
-    send_experiment_end_marker = not photodiode_test_mode
 
     # --- output file names ---------------------------------------------------
     stamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -752,19 +769,13 @@ def main():
     # --- load trial tables (before opening the window, so errors show early) -
     practice_rows = read_trials(conditions_dir / "practice_trials.csv")
     main_rows     = read_trials(conditions_dir / "main_trials.csv")
-    all_rows      = practice_rows # + main_rows
+    all_rows      = practice_rows + main_rows
 
     event_writer, event_f = make_event_writer(str(base) + "_events.csv")
     trial_writer, trial_f = make_trial_writer(str(base) + "_trials.csv")
 
-    # --- LSL trigger outlet (created before the window so Computer A can
-    #     connect while the participant is reading the instructions) ----------
-    trigger = LSLTrigger(enabled=send_lsl_triggers)
-    if send_lsl_triggers:
-        print("\nLSL outlet 'experiment_markers' is live at 600 Hz.")
-        input("Start the Simulink model on Computer A, then press Enter here...")
-
     win = None
+    trigger = None
     try:
         # --- window ----------------------------------------------------------
         win = visual.Window(size=(1200, 800), fullscr=fullscreen, units="pix",
@@ -802,7 +813,8 @@ def main():
             f.write(f"frame_rate_measured: {frame_rate}\n")
             for k, v in frame_counts.items():
                 f.write(f"frames[{k}]: {v}\n")
-            f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
+            f.write(f"send_EEG_triggers: {send_eeg_triggers}\n")
+            f.write(f"parallel_port_address: {exp_info['parallel_port_address']}\n")
             f.write(f"photodiode_square: {use_photodiode_square}\n")
             f.write(f"photodiode_square_enabled: {use_photodiode_square}\n")
             f.write(f"photodiode_square_size_px: {DIODE_SIZE}\n")
@@ -814,7 +826,23 @@ def main():
             f.write(f"photodiode_test_trigger: {PHOTODIODE_TEST_TRIGGER}\n")
             f.write(f"photodiode_hardware_chain: {PHOTODIODE_HARDWARE_CHAIN}\n")
 
-        # --- stimuli --------------------------------------------------------
+        # --- hardware + stimuli ---------------------------------------------
+        trigger = EEGTrigger(enabled=send_eeg_triggers,
+                             address=exp_info["parallel_port_address"])
+
+        diode_stim = None
+        if use_photodiode_square or photodiode_test_mode:
+            diode_stim = make_diode_stim(
+                win,
+                size=DIODE_SIZE,
+                margin=DIODE_MARGIN,
+                corner=DIODE_CORNER,
+            )
+
+        if photodiode_test_mode:
+            run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base)
+            return
+
         image_stims = preload_images(win, root, all_rows)
 
         instruction_text = visual.TextStim(win, text="", pos=(0, 0),
@@ -842,19 +870,6 @@ def main():
         fix_stim = visual.TextStim(win, text="+", pos=(0, 0), height=FIX_HEIGHT,
                                    color="white", font=TEXT_FONT, units="pix")
 
-        diode_stim = None
-        if use_photodiode_square or photodiode_test_mode:
-            diode_stim = make_diode_stim(
-                win,
-                size=DIODE_SIZE,
-                margin=DIODE_MARGIN,
-                corner=DIODE_CORNER,
-            )
-
-        if photodiode_test_mode:
-            run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base)
-            return
-
         # --- instructions ----------------------------------------------------
         show_text_and_wait(win, kb, instruction_text,
             "In this task you will see words and faces.\n\n"
@@ -864,18 +879,14 @@ def main():
             "Try not to blink during the face sequences.\n\n"
             "Press SPACE to begin the practice.")
 
-        trigger.set(1)     # experiment start — participant confirmed, first trial imminent
-
         # --- practice block --------------------------------------------------
         trial_global = 0
-        trigger.set(70)    # practice phase start
         for row in practice_rows:
             trial_global += 1
             run_trial(row, "practice", participant, session, trial_global,
                       win, kb, event_writer, event_f, trial_writer, trial_f,
                       image_stims, trigger, fix_stim, prime_stim,
                       frame_counts, diode_stim)
-        trigger.set(71)    # practice phase end
 
         show_text_and_wait(win, kb, instruction_text,
             "Practice complete.\n\nThe main experiment will now begin.\n\n"
@@ -883,7 +894,6 @@ def main():
             "Press SPACE to start Block 1.")
 
         # --- main blocks -----------------------------------------------------
-        trigger.set(72)    # main experiment start
         blocks = sorted({r["block"] for r in main_rows}, key=sort_block_value)
         for block_i, block in enumerate(blocks, start=1):
             block_rows = [r for r in main_rows if r["block"] == block]
@@ -894,21 +904,17 @@ def main():
                 "Try not to blink during the face sequences.\n\n"
                 "Press SPACE when you are ready.")
 
-            trigger.set(73)    # block start
             for row in block_rows:
                 trial_global += 1
                 run_trial(row, "main", participant, session, trial_global,
                           win, kb, event_writer, event_f, trial_writer, trial_f,
                           image_stims, trigger, fix_stim, prime_stim,
                           frame_counts, diode_stim)
-            trigger.set(74)    # block end
 
             if block_i < len(blocks):         # eyes-closed rest between blocks
-                trigger.set(75)    # rest start
                 show_text_and_wait(win, kb, instruction_text,
                     "Rest period.\n\nYou may close your eyes and rest.\n\n"
                     "Press SPACE when you are ready to continue.")
-                trigger.set(76)    # rest end
 
         # --- end screen ------------------------------------------------------
         show_text_and_wait(win, kb, instruction_text,
@@ -921,10 +927,8 @@ def main():
         # Log the full traceback so an unexpected crash is diagnosable.
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
     finally:
-        if send_experiment_end_marker:
-            trigger.set(99)    # experiment end — always fires on real runs
-        trigger.clear()
-        trigger.stop()
+        if trigger is not None:
+            trigger.clear()
         if win is not None:
             write_frame_intervals(win, str(base) + "_frame_intervals.csv")
             win.close()
