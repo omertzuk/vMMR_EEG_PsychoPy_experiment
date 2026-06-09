@@ -35,8 +35,6 @@ import csv
 import random
 import unicodedata
 
-from lsl_trigger import LSLTrigger
-
 # =============================================================================
 # 1. CONSTANTS  -- all timings come straight from the paper's Methods section
 # =============================================================================
@@ -65,18 +63,18 @@ FACE_SIZE   = (425, 405)   # matches the paper's face images
 PRIME_Y     = 260          # prime word sits above the face
 TEXT_HEIGHT = 34
 FIX_HEIGHT  = 42
-TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
+# TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
 # TEXT_FONT = "Tahoma"
 # TEXT_FONT = "Narkisim"
 # TEXT_FONT = "Miriam"
 # TEXT_FONT = "Segoe UI"
-# TEXT_FONT = "Noto Sans Hebrew"
+TEXT_FONT = "Noto Sans Hebrew"
 
 # --- Photodiode timing marker -----------------------------------------------
 # The square is only a visible luminance event on the monitor. The external
 # GTEC-0270 optical sensor and GTEC-0274W g.TRIGbox convert this light change
 # into a TTL trigger for g.HIamp; PsychoPy does not control that hardware.
-DIODE_SIZE      = 45
+DIODE_SIZE      = 100
 DIODE_MARGIN    = 40
 DIODE_CORNER    = "bottom_right"
 DIODE_COLOR_ON  = "white"
@@ -94,9 +92,6 @@ PHOTODIODE_HARDWARE_CHAIN = (
 # One code per (PRIME, IDENTITY, ROLE). ROLE is the face's job in the sequence:
 #   STD/DEV          -> ordinary standard / deviant face
 #   TARGET_STD/_DEV  -> a target (sunglasses) face placed at a standard / deviant slot
-# Additional system triggers:
-#   9: Experiment start (sent after window opens and stimuli are loaded)
-#   99: Experiment end or abort (sent on ESC or normal completion)
 TRIGGER_MAP = {
     ("DEATH",    "SELF",  "STD"):        11,
     ("DEATH",    "SELF",  "DEV"):        12,
@@ -196,7 +191,6 @@ def sort_block_value(x):
         return (0, int(x))
     except (ValueError, TypeError):
         return (1, str(x))
-
 
 
 # =============================================================================
@@ -744,28 +738,26 @@ def main():
     exp_info = {
         "participant": "test001",
         "session": "001",
-        "fullscreen": True,
-        "send_LSL_triggers": True,
+        "fullscreen": False,
+        "send_EEG_triggers": False,
         "parallel_port_address": "0x0378",
-        "photodiode_square": True,
+        "photodiode_square": False,
         "photodiode_test_mode": False,
     }
     dlg = gui.DlgFromDict(exp_info, title="vMMR EEG experiment",
                           order=["participant", "session", "fullscreen",
-                                 "send_LSL_triggers",
-                                 "parallel_port_address",
+                                 "send_EEG_triggers", "parallel_port_address",
                                  "photodiode_square",
                                  "photodiode_test_mode"])
     if not dlg.OK:
         core.quit()
 
-    participant            = exp_info["participant"]
-    session                = exp_info["session"]
-    fullscreen             = bool(exp_info["fullscreen"])
-    send_eeg_triggers      = False
-    send_lsl_triggers      = bool(exp_info["send_LSL_triggers"])
-    use_photodiode_square  = bool(exp_info["photodiode_square"])
-    photodiode_test_mode   = bool(exp_info["photodiode_test_mode"])
+    participant       = exp_info["participant"]
+    session           = exp_info["session"]
+    fullscreen        = bool(exp_info["fullscreen"])
+    send_eeg_triggers = bool(exp_info["send_EEG_triggers"])
+    use_photodiode_square = bool(exp_info["photodiode_square"])
+    photodiode_test_mode  = bool(exp_info["photodiode_test_mode"])
 
     # --- output file names ---------------------------------------------------
     stamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -785,18 +777,6 @@ def main():
     win = None
     trigger = None
     try:
-        # --- hardware: wait for Simulink before opening the screen (LSL mode) -
-        if send_lsl_triggers:
-            trigger = LSLTrigger(enabled=True)
-            print("LSL marker stream 'experiment_markers' created.")
-            input(
-                "\nOutlet live. Start the Simulink model, "
-                "then press Enter when ready..."
-            )
-        else:
-            trigger = EEGTrigger(enabled=send_eeg_triggers,
-                                 address=exp_info["parallel_port_address"])
-
         # --- window ----------------------------------------------------------
         win = visual.Window(size=(1200, 800), fullscr=fullscreen, units="pix",
                              color="black", allowGUI=not fullscreen,
@@ -834,7 +814,6 @@ def main():
             for k, v in frame_counts.items():
                 f.write(f"frames[{k}]: {v}\n")
             f.write(f"send_EEG_triggers: {send_eeg_triggers}\n")
-            f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
             f.write(f"parallel_port_address: {exp_info['parallel_port_address']}\n")
             f.write(f"photodiode_square: {use_photodiode_square}\n")
             f.write(f"photodiode_square_enabled: {use_photodiode_square}\n")
@@ -846,6 +825,10 @@ def main():
             f.write(f"photodiode_test_flashes: {PHOTODIODE_TEST_FLASHES}\n")
             f.write(f"photodiode_test_trigger: {PHOTODIODE_TEST_TRIGGER}\n")
             f.write(f"photodiode_hardware_chain: {PHOTODIODE_HARDWARE_CHAIN}\n")
+
+        # --- hardware + stimuli ---------------------------------------------
+        trigger = EEGTrigger(enabled=send_eeg_triggers,
+                             address=exp_info["parallel_port_address"])
 
         diode_stim = None
         if use_photodiode_square or photodiode_test_mode:
@@ -886,10 +869,6 @@ def main():
         
         fix_stim = visual.TextStim(win, text="+", pos=(0, 0), height=FIX_HEIGHT,
                                    color="white", font=TEXT_FONT, units="pix")
-
-        # --- send experiment start trigger -----------------------------------
-        if trigger is not None:
-            trigger.set(9)
 
         # --- instructions ----------------------------------------------------
         show_text_and_wait(win, kb, instruction_text,
@@ -941,26 +920,15 @@ def main():
         show_text_and_wait(win, kb, instruction_text,
             "The experiment is complete.\n\nThank you.\n\n"
             "Press SPACE to exit.")
-        # Send experiment end trigger
-        if trigger is not None:
-            trigger.set(99)
 
     except KeyboardInterrupt as e:
         logging.warning(f"Run ended early: {e}")
-        # Send abort trigger
-        if trigger is not None:
-            trigger.set(99)
     except Exception as e:
         # Log the full traceback so an unexpected crash is diagnosable.
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
-        # Send error/abort trigger
-        if trigger is not None:
-            trigger.set(99)
     finally:
         if trigger is not None:
             trigger.clear()
-            if hasattr(trigger, "stop"):
-                trigger.stop()
         if win is not None:
             write_frame_intervals(win, str(base) + "_frame_intervals.csv")
             win.close()

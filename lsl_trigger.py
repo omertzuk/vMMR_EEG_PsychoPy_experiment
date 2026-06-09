@@ -2,8 +2,8 @@
 lsl_trigger.py — LSL marker outlet for the vMMR EEG experiment.
 
 Drop-in replacement for the parallel-port EEGTrigger. Creates a stream named
-'experiment_markers' (int32, 600 Hz) and keeps it alive with a background
-thread that pushes [0] at 600 Hz so Simulink's LSL Receive block never stalls.
+'experiment_markers' (int32, 10 Hz) and keeps it alive with a background
+thread that pushes [0] at 10 Hz so Simulink's LSL Receive block never stalls.
 
 Interface is identical to EEGTrigger:
     trigger = LSLTrigger(enabled=True)
