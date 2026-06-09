@@ -19,8 +19,8 @@ import threading
 from pylsl import StreamInfo, StreamOutlet
 
 _STREAM_NAME     = 'experiment_markers'
-_KEEPALIVE_HZ    = 600
-_NOMINAL_SRATE   = 600
+_KEEPALIVE_HZ    = 1200
+_NOMINAL_SRATE   = 1200
 
 
 class LSLTrigger:
