@@ -172,9 +172,9 @@ A startup dialog will appear with these fields:
 participant
 session
 fullscreen
-send_EEG_triggers
-parallel_port_address
+send_LSL_triggers
 photodiode_square
+photodiode_test_mode
 ```
 
 For the first dry run, use:
@@ -183,21 +183,21 @@ For the first dry run, use:
 participant: test001
 session: 001
 fullscreen: unchecked
-send_EEG_triggers: unchecked
-parallel_port_address: 0x0378
+send_LSL_triggers: unchecked
 photodiode_square: unchecked
+photodiode_test_mode: unchecked
 ```
 
 For EEG testing, use:
 
 ```text
 fullscreen: checked
-send_EEG_triggers: checked
-parallel_port_address: lab-specific value
+send_LSL_triggers: checked
 photodiode_square: checked if using photodiode validation
+photodiode_test_mode: checked only for optical calibration runs
 ```
 
-Do not enable EEG triggers until the lab computer and trigger port address have been confirmed.
+Do not enable LSL triggers until the lab acquisition setup has been confirmed.
 
 ## Response key
 
@@ -231,6 +231,50 @@ Trigger codes:
 Triggers are sent using `win.callOnFlip(...)`, so they are aligned with the screen flip on which the face appears.
 
 The trigger is cleared one frame later.
+
+## Photodiode / optical timing validation
+
+The `photodiode_square` checkbox controls only whether PsychoPy draws a visible
+white square on the monitor. PsychoPy does not control the g.TRIGbox directly.
+
+Hardware chain:
+
+```text
+PsychoPy screen output
+    -> GTEC-0270 optical sensor
+    -> GTEC-0274W g.TRIGbox
+    -> GTEC-0274TR adapter
+    -> g.HIamp DIGITAL IN
+```
+
+The ordinary PsychoPy/LSL trigger marks event identity and condition. The optical
+trigger marks the physical screen onset detected by the sensor. In analysis, use
+the condition trigger for labels and the g.TRIGbox optical channel to estimate or
+correct visual-onset delay/jitter.
+
+The square defaults to:
+
+```text
+size: 100 x 100 px
+corner: bottom_right
+margin: 40 px
+color: white
+```
+
+When `photodiode_square` is checked during the experiment, the square is drawn
+only during face-on frames. It is not drawn during fixation, prime-only,
+prime-plus-fixation, blank, instruction, or rest screens.
+
+For calibration, check `photodiode_test_mode`. This flashes the square 100 times
+before the real experiment and then quits. It writes:
+
+```text
+<participant>_ses-<session>_<timestamp>_photodiode_test.csv
+```
+
+Each flash is 250 ms on and 350 ms black, using the same frame-count conversion
+as the face events. If `send_LSL_triggers` is checked, marker `99` is sent on the
+same flip as each flash onset during this test mode.
 
 ## Output files
 
@@ -341,9 +385,13 @@ session
 timestamp
 measured frame rate
 frame counts for each task period
-EEG trigger setting
-parallel-port address
-photodiode setting
+LSL trigger setting
+photodiode_square_enabled
+photodiode_square_size_px
+photodiode_square_corner
+photodiode_square_margin_px
+photodiode_test_mode
+photodiode_hardware_chain
 ```
 
 ## Recommended dry-run checks
@@ -413,7 +461,7 @@ Suggested baseline:
 2. The prime word remains visible throughout the trial.
 3. A 500 ms post-sequence interval was added to capture late responses to targets appearing in the final face position.
 4. The current response key is SPACE.
-5. Hebrew rendering uses `languageStyle="RTL"` in the PsychoPy `TextStim`.
+5. Hebrew rendering uses `languageStyle="RTL"` in the PsychoPy `TextBox2`.
 6. EEG triggers are optional and disabled by default.
 7. The script is currently version `v0`; preserve this file unchanged once dry-run testing starts.
 
