@@ -88,6 +88,18 @@ PHOTODIODE_HARDWARE_CHAIN = (
     "GTEC-0274TR adapter -> g.HIamp DIGITAL IN"
 )
 
+# --- LSL/Simulink buffering diagnostic --------------------------------------
+# This is separate from the real vMMR task. It flashes a large photodiode
+# square and sends unique LSL markers on the same flip, then exits.
+LSL_BUFFER_TEST_FLASHES = 100
+LSL_BUFFER_TEST_MARKER_BASE = 1000
+LSL_BUFFER_TEST_ON_DUR = 0.250
+LSL_BUFFER_TEST_OFF_DUR = 0.750
+LSL_BUFFER_TEST_INITIAL_BLACK_DUR = 2.000
+LSL_BUFFER_TEST_DIODE_SIZE = 120
+LSL_BUFFER_TEST_DIODE_MARGIN = 80
+LSL_BUFFER_TEST_DIODE_CORNER = "bottom_right"
+
 # =============================================================================
 # 2. EEG TRIGGER CODES
 # =============================================================================
@@ -131,6 +143,14 @@ def to_int(value, default=0):
     if s == "" or s.lower() in ("nan", "none"):
         return default
     return int(float(s))
+
+
+def to_float(value, default=0.0):
+    """Parse a dialog/CSV value to float, accepting blank cells as a default."""
+    s = str(value).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return default
+    return float(s)
 
 
 def normalize_prime(value):
@@ -590,6 +610,96 @@ def run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base_path):
             f.flush()
 
 
+def run_lsl_buffer_test(win, kb, trigger, frame_counts, base_path):
+    """Flash a large diode square with unique LSL markers, then exit.
+
+    This diagnostic tests whether a long marker-to-optical delay comes from the
+    LSL/Simulink path rather than real display latency. The square and marker
+    are both scheduled on the same `win.flip()` via `win.callOnFlip(...)`.
+    """
+    diode_stim = make_diode_stim(
+        win,
+        size=LSL_BUFFER_TEST_DIODE_SIZE,
+        margin=LSL_BUFFER_TEST_DIODE_MARGIN,
+        corner=LSL_BUFFER_TEST_DIODE_CORNER,
+    )
+    out_path = Path(str(base_path) + "_lsl_buffer_test.csv")
+    on_frames = frame_counts["lsl_buffer_on"]
+    off_frames = frame_counts["lsl_buffer_off"]
+    initial_black_frames = frame_counts["lsl_buffer_initial_black"]
+    fields = [
+        "flash_index",
+        "marker_code",
+        "psychopy_global_onset_time",
+        "lsl_push_timestamp",
+        "intended_on_duration",
+        "intended_off_duration",
+        "frame_rate",
+        "on_frames",
+        "off_frames",
+        "notes",
+    ]
+
+    def _check_abort():
+        check_escape()
+        keys = kb.getKeys(keyList=[QUIT_KEY], waitRelease=False, clear=True)
+        for k in keys:
+            if k.name == QUIT_KEY:
+                raise KeyboardInterrupt("LSL buffer test aborted with ESCAPE.")
+
+    def _black_frames(n_frames):
+        for _ in range(n_frames):
+            win.flip()
+            _check_abort()
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        kb.clearEvents()
+        psychopy_event.clearEvents()
+
+        # Stable black baseline before the first optical pulse.
+        _black_frames(initial_black_frames)
+
+        for flash_index in range(1, LSL_BUFFER_TEST_FLASHES + 1):
+            marker_code = LSL_BUFFER_TEST_MARKER_BASE + flash_index
+            onset = {"psychopy": None, "lsl": None}
+
+            def _send_marker_and_capture(code=marker_code):
+                onset["psychopy"] = logging.defaultClock.getTime()
+                if hasattr(trigger, "set_with_timestamp"):
+                    onset["lsl"] = trigger.set_with_timestamp(code)
+                else:
+                    trigger.set(code)
+                    onset["lsl"] = None
+
+            for frame_n in range(on_frames):
+                diode_stim.draw()
+                if frame_n == 0:
+                    win.callOnFlip(_send_marker_and_capture)
+                if frame_n == 1:
+                    win.callOnFlip(trigger.clear)
+                win.flip()
+                _check_abort()
+
+            _black_frames(off_frames)
+
+            writer.writerow({
+                "flash_index": flash_index,
+                "marker_code": marker_code,
+                "psychopy_global_onset_time": onset["psychopy"],
+                "lsl_push_timestamp": onset["lsl"],
+                "intended_on_duration": LSL_BUFFER_TEST_ON_DUR,
+                "intended_off_duration": LSL_BUFFER_TEST_OFF_DUR,
+                "frame_rate": frame_counts["rate"],
+                "on_frames": on_frames,
+                "off_frames": off_frames,
+                "notes": "marker and square scheduled on same flip",
+            })
+            f.flush()
+
+
 # =============================================================================
 # 12. SCORE ONE TRIAL  -- trial-level continuous-response attribution
 # =============================================================================
@@ -749,13 +859,19 @@ def main():
         "parallel_port_address": "0x0378",
         "photodiode_square": True,
         "photodiode_test_mode": False,
+        "lsl_buffer_test_mode": False,
+        "lsl_keepalive_hz": 1200,
+        "lsl_nominal_srate": 1200,
     }
     dlg = gui.DlgFromDict(exp_info, title="vMMR EEG experiment",
                           order=["participant", "session", "fullscreen",
                                  "send_LSL_triggers",
                                  "parallel_port_address",
                                  "photodiode_square",
-                                 "photodiode_test_mode"])
+                                 "photodiode_test_mode",
+                                 "lsl_buffer_test_mode",
+                                 "lsl_keepalive_hz",
+                                 "lsl_nominal_srate"])
     if not dlg.OK:
         core.quit()
 
@@ -766,6 +882,15 @@ def main():
     send_lsl_triggers      = bool(exp_info["send_LSL_triggers"])
     use_photodiode_square  = bool(exp_info["photodiode_square"])
     photodiode_test_mode   = bool(exp_info["photodiode_test_mode"])
+    lsl_buffer_test_mode   = bool(exp_info["lsl_buffer_test_mode"])
+    lsl_keepalive_hz       = to_float(exp_info["lsl_keepalive_hz"],
+                                      default=1200.0)
+    lsl_nominal_srate      = to_float(exp_info["lsl_nominal_srate"],
+                                      default=1200.0)
+    if lsl_keepalive_hz <= 0:
+        raise ValueError("lsl_keepalive_hz must be positive.")
+    if lsl_nominal_srate <= 0:
+        raise ValueError("lsl_nominal_srate must be positive.")
 
     # --- output file names ---------------------------------------------------
     stamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -774,20 +899,18 @@ def main():
     log_file = logging.LogFile(str(base) + ".log", level=logging.EXP)
     logging.console.setLevel(logging.WARNING)
 
-    # --- load trial tables (before opening the window, so errors show early) -
-    practice_rows = read_trials(conditions_dir / "practice_trials.csv")
-    main_rows     = read_trials(conditions_dir / "main_trials.csv")
-    all_rows      = practice_rows + main_rows
-
-    event_writer, event_f = make_event_writer(str(base) + "_events.csv")
-    trial_writer, trial_f = make_trial_writer(str(base) + "_trials.csv")
-
     win = None
     trigger = None
+    event_f = None
+    trial_f = None
     try:
         # --- hardware: wait for Simulink before opening the screen (LSL mode) -
         if send_lsl_triggers:
-            trigger = LSLTrigger(enabled=True)
+            trigger = LSLTrigger(
+                enabled=True,
+                keepalive_hz=lsl_keepalive_hz,
+                nominal_srate=lsl_nominal_srate,
+            )
             print("LSL marker stream 'experiment_markers' created.")
             input(
                 "\nOutlet live. Start the Simulink model, "
@@ -824,6 +947,10 @@ def main():
             "face_on":  n_frames(FACE_ON_DUR),
             "blank":    n_frames(FACE_BLANK_DUR),
             "post_seq": n_frames(POST_SEQUENCE_DUR),
+            "lsl_buffer_initial_black": n_frames(
+                LSL_BUFFER_TEST_INITIAL_BLACK_DUR),
+            "lsl_buffer_on": n_frames(LSL_BUFFER_TEST_ON_DUR),
+            "lsl_buffer_off": n_frames(LSL_BUFFER_TEST_OFF_DUR),
         }
 
         # --- run-info diagnostics file --------------------------------------
@@ -835,6 +962,8 @@ def main():
                 f.write(f"frames[{k}]: {v}\n")
             f.write(f"send_EEG_triggers: {send_eeg_triggers}\n")
             f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
+            f.write(f"lsl_keepalive_hz: {lsl_keepalive_hz}\n")
+            f.write(f"lsl_nominal_srate: {lsl_nominal_srate}\n")
             f.write(f"parallel_port_address: {exp_info['parallel_port_address']}\n")
             f.write(f"photodiode_square: {use_photodiode_square}\n")
             f.write(f"photodiode_square_enabled: {use_photodiode_square}\n")
@@ -846,6 +975,48 @@ def main():
             f.write(f"photodiode_test_flashes: {PHOTODIODE_TEST_FLASHES}\n")
             f.write(f"photodiode_test_trigger: {PHOTODIODE_TEST_TRIGGER}\n")
             f.write(f"photodiode_hardware_chain: {PHOTODIODE_HARDWARE_CHAIN}\n")
+            f.write(f"lsl_buffer_test_mode: {lsl_buffer_test_mode}\n")
+            f.write(f"lsl_buffer_test_flashes: {LSL_BUFFER_TEST_FLASHES}\n")
+            f.write(
+                "lsl_buffer_test_marker_start: "
+                f"{LSL_BUFFER_TEST_MARKER_BASE + 1}\n"
+            )
+            f.write(
+                "lsl_buffer_test_marker_end: "
+                f"{LSL_BUFFER_TEST_MARKER_BASE + LSL_BUFFER_TEST_FLASHES}\n"
+            )
+            f.write(
+                "lsl_buffer_test_on_duration: "
+                f"{LSL_BUFFER_TEST_ON_DUR:.3f}\n"
+            )
+            f.write(
+                "lsl_buffer_test_off_duration: "
+                f"{LSL_BUFFER_TEST_OFF_DUR:.3f}\n"
+            )
+            f.write(
+                "lsl_buffer_test_square_size_px: "
+                f"{LSL_BUFFER_TEST_DIODE_SIZE}\n"
+            )
+            f.write(
+                "lsl_buffer_test_square_corner: "
+                f"{LSL_BUFFER_TEST_DIODE_CORNER}\n"
+            )
+            f.write(
+                "lsl_buffer_test_square_margin_px: "
+                f"{LSL_BUFFER_TEST_DIODE_MARGIN}\n"
+            )
+
+        if lsl_buffer_test_mode:
+            run_lsl_buffer_test(win, kb, trigger, frame_counts, base)
+            return
+
+        # --- load trial tables and open task writers ------------------------
+        practice_rows = read_trials(conditions_dir / "practice_trials.csv")
+        main_rows     = read_trials(conditions_dir / "main_trials.csv")
+        all_rows      = practice_rows + main_rows
+
+        event_writer, event_f = make_event_writer(str(base) + "_events.csv")
+        trial_writer, trial_f = make_trial_writer(str(base) + "_trials.csv")
 
         diode_stim = None
         if use_photodiode_square or photodiode_test_mode:
@@ -948,13 +1119,13 @@ def main():
     except KeyboardInterrupt as e:
         logging.warning(f"Run ended early: {e}")
         # Send abort trigger
-        if trigger is not None:
+        if trigger is not None and not lsl_buffer_test_mode:
             trigger.set(99)
     except Exception as e:
         # Log the full traceback so an unexpected crash is diagnosable.
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
         # Send error/abort trigger
-        if trigger is not None:
+        if trigger is not None and not lsl_buffer_test_mode:
             trigger.set(99)
     finally:
         if trigger is not None:
@@ -964,8 +1135,10 @@ def main():
         if win is not None:
             write_frame_intervals(win, str(base) + "_frame_intervals.csv")
             win.close()
-        event_f.close()
-        trial_f.close()
+        if event_f is not None:
+            event_f.close()
+        if trial_f is not None:
+            trial_f.close()
         logging.flush()
         core.quit()
 

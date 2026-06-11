@@ -173,8 +173,12 @@ participant
 session
 fullscreen
 send_LSL_triggers
+parallel_port_address
 photodiode_square
 photodiode_test_mode
+lsl_buffer_test_mode
+lsl_keepalive_hz
+lsl_nominal_srate
 ```
 
 For the first dry run, use:
@@ -184,8 +188,12 @@ participant: test001
 session: 001
 fullscreen: unchecked
 send_LSL_triggers: unchecked
+parallel_port_address: 0x0378
 photodiode_square: unchecked
 photodiode_test_mode: unchecked
+lsl_buffer_test_mode: unchecked
+lsl_keepalive_hz: 1200
+lsl_nominal_srate: 1200
 ```
 
 For EEG testing, use:
@@ -193,8 +201,12 @@ For EEG testing, use:
 ```text
 fullscreen: checked
 send_LSL_triggers: checked
+parallel_port_address: 0x0378
 photodiode_square: checked if using photodiode validation
 photodiode_test_mode: checked only for optical calibration runs
+lsl_buffer_test_mode: checked only for LSL/Simulink buffering diagnostics
+lsl_keepalive_hz: 1200
+lsl_nominal_srate: 1200
 ```
 
 Do not enable LSL triggers until the lab acquisition setup has been confirmed.
@@ -275,6 +287,65 @@ before the real experiment and then quits. It writes:
 Each flash is 250 ms on and 350 ms black, using the same frame-count conversion
 as the face events. If `send_LSL_triggers` is checked, marker `99` is sent on the
 same flip as each flash onset during this test mode.
+
+### LSL buffering diagnostic
+
+Use `lsl_buffer_test_mode` to test whether a long delay between PsychoPy markers
+and the optical g.TRIGbox channel is caused by the LSL/Simulink acquisition path
+rather than true display latency. This mode is separate from the vMMR task: it
+opens the LSL outlet and PsychoPy window, runs the diagnostic, writes a CSV file,
+and quits before loading or running the real experiment.
+
+Recommended settings:
+
+```text
+send_LSL_triggers: checked
+photodiode_square: either checked or unchecked
+photodiode_test_mode: unchecked
+lsl_buffer_test_mode: checked
+lsl_keepalive_hz: 1200
+lsl_nominal_srate: 1200
+```
+
+The diagnostic starts with a 2 s black baseline, then repeats 100 flashes:
+
+```text
+white square on: 250 ms
+black screen off: 750 ms
+marker codes: 1001, 1002, ..., 1100
+square: 120 x 120 px, bottom_right, 80 px margin
+```
+
+Each LSL marker is sent on the same `win.flip()` that draws the square. The
+diagnostic writes:
+
+```text
+<participant>_ses-<session>_<timestamp>_lsl_buffer_test.csv
+```
+
+Important columns:
+
+```text
+flash_index
+marker_code
+psychopy_global_onset_time
+lsl_push_timestamp
+frame_rate
+on_frames
+off_frames
+```
+
+Compare the PsychoPy CSV, Simulink LSL markers `1001`-`1100`, and the g.HIamp
+photodiode channel. If PsychoPy reports that the LSL marker was pushed on the
+same flip as the square but Simulink shows a large lag to the optical edge, the
+likely cause is LSL/Simulink buffering or timestamp handling. If this diagnostic
+has a small stable lag but the real task does not, check whether the real-task
+comparison is matching the photodiode pulse to the corresponding face-event
+trigger rather than to a trial-start or prime event.
+
+You can repeat the diagnostic with lower `lsl_keepalive_hz` and
+`lsl_nominal_srate` values, such as 100 or 10, to see whether the apparent lag
+changes with LSL stream rate.
 
 ## Output files
 
@@ -391,6 +462,8 @@ photodiode_square_size_px
 photodiode_square_corner
 photodiode_square_margin_px
 photodiode_test_mode
+lsl_buffer_test_mode
+lsl_buffer_test marker range and flash settings
 photodiode_hardware_chain
 ```
 
