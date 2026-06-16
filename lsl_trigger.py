@@ -87,6 +87,30 @@ class LSLTrigger:
         if self.outlet is not None:
             self.outlet.push_sample([0], pushthrough=True)
 
+    def pause_keepalive(self):
+        """Stop the background keepalive thread (call resume_keepalive to restart).
+
+        Use this before a diagnostic loop that drives LSL manually so keepalive
+        zeros don't compete with intentional marker codes in the buffer.
+        """
+        if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+            self._stop_event.set()
+            self._keepalive_thread.join(timeout=1.0)
+        self._keepalive_thread = None
+        self._stop_event.clear()
+
+    def resume_keepalive(self):
+        """Restart the background keepalive thread after pause_keepalive."""
+        if self.outlet is None or self._keepalive_thread is not None:
+            return
+        self._stop_event.clear()
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive,
+            args=(self.outlet, self._stop_event, self.keepalive_hz),
+            daemon=True,
+        )
+        self._keepalive_thread.start()
+
     def stop(self):
         self._stop_event.set()
         if self._keepalive_thread is not None:
