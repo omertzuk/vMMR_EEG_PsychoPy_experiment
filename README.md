@@ -310,9 +310,10 @@ lsl_nominal_srate: 1200
 The diagnostic starts with a 2 s black baseline, then repeats 100 flashes:
 
 ```text
+experiment-start marker: 9, sent before the black baseline
 white square on: 250 ms
 black screen off: 750 ms
-marker codes: 1001, 1002, ..., 1100
+marker codes: 101, 102, ..., 200
 square: 120 x 120 px, bottom_right, 80 px margin
 ```
 
@@ -335,7 +336,7 @@ on_frames
 off_frames
 ```
 
-Compare the PsychoPy CSV, Simulink LSL markers `1001`-`1100`, and the g.HIamp
+Compare the PsychoPy CSV, Simulink LSL markers `101`-`200`, and the g.HIamp
 photodiode channel. If PsychoPy reports that the LSL marker was pushed on the
 same flip as the square but Simulink shows a large lag to the optical edge, the
 likely cause is LSL/Simulink buffering or timestamp handling. If this diagnostic

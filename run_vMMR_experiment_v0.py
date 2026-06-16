@@ -92,7 +92,7 @@ PHOTODIODE_HARDWARE_CHAIN = (
 # This is separate from the real vMMR task. It flashes a large photodiode
 # square and sends unique LSL markers on the same flip, then exits.
 LSL_BUFFER_TEST_FLASHES = 100
-LSL_BUFFER_TEST_MARKER_BASE = 1000
+LSL_BUFFER_TEST_MARKER_BASE = 100
 LSL_BUFFER_TEST_ON_DUR = 0.250
 LSL_BUFFER_TEST_OFF_DUR = 0.750
 LSL_BUFFER_TEST_INITIAL_BLACK_DUR = 2.000
@@ -979,6 +979,7 @@ def main():
             f.write(f"photodiode_hardware_chain: {PHOTODIODE_HARDWARE_CHAIN}\n")
             f.write(f"lsl_buffer_test_mode: {lsl_buffer_test_mode}\n")
             f.write(f"lsl_buffer_test_flashes: {LSL_BUFFER_TEST_FLASHES}\n")
+            f.write("lsl_buffer_test_start_trigger: 9\n")
             f.write(
                 "lsl_buffer_test_marker_start: "
                 f"{LSL_BUFFER_TEST_MARKER_BASE + 1}\n"
@@ -1009,6 +1010,10 @@ def main():
             )
 
         if lsl_buffer_test_mode:
+            # Match the normal experiment startup marker so acquisition pipelines
+            # that gate recordings on experiment start also capture this diagnostic.
+            if trigger is not None:
+                trigger.set(9)
             run_lsl_buffer_test(win, kb, trigger, frame_counts, base)
             return
 
