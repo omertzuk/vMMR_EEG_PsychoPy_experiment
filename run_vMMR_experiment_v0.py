@@ -65,8 +65,8 @@ FACE_SIZE   = (425, 405)   # matches the paper's face images
 PRIME_Y     = 260          # prime word sits above the face
 TEXT_HEIGHT = 34
 FIX_HEIGHT  = 42
-TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
-# TEXT_FONT = "Tahoma"
+# TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
+TEXT_FONT = "Tahoma"
 # TEXT_FONT = "Narkisim"
 # TEXT_FONT = "Miriam"
 # TEXT_FONT = "Segoe UI"
@@ -96,7 +96,7 @@ LSL_BUFFER_TEST_MARKER_BASE = 1000
 LSL_BUFFER_TEST_ON_DUR = 0.250
 LSL_BUFFER_TEST_OFF_DUR = 0.750
 LSL_BUFFER_TEST_INITIAL_BLACK_DUR = 2.000
-LSL_BUFFER_TEST_DIODE_SIZE = 120
+LSL_BUFFER_TEST_DIODE_SIZE = 30
 LSL_BUFFER_TEST_DIODE_MARGIN = 80
 LSL_BUFFER_TEST_DIODE_CORNER = "bottom_right"
 
@@ -619,9 +619,9 @@ def run_lsl_buffer_test(win, kb, trigger, frame_counts, base_path):
     """
     diode_stim = make_diode_stim(
         win,
-        size=LSL_BUFFER_TEST_DIODE_SIZE,
-        margin=LSL_BUFFER_TEST_DIODE_MARGIN,
-        corner=LSL_BUFFER_TEST_DIODE_CORNER,
+        size=DIODE_SIZE,
+        margin=DIODE_MARGIN,
+        corner=DIODE_CORNER,
     )
     out_path = Path(str(base_path) + "_lsl_buffer_test.csv")
     on_frames = frame_counts["lsl_buffer_on"]
@@ -674,6 +674,8 @@ def run_lsl_buffer_test(win, kb, trigger, frame_counts, base_path):
                     trigger.set(code)
                     onset["lsl"] = None
 
+            # Identical to present_face_event: send trigger at frame 0,
+            # clear at frame 1 (1-frame pulse).  Keepalive continues running.
             for frame_n in range(on_frames):
                 diode_stim.draw()
                 if frame_n == 0:
@@ -995,15 +997,15 @@ def main():
             )
             f.write(
                 "lsl_buffer_test_square_size_px: "
-                f"{LSL_BUFFER_TEST_DIODE_SIZE}\n"
+                f"{DIODE_SIZE}\n"
             )
             f.write(
                 "lsl_buffer_test_square_corner: "
-                f"{LSL_BUFFER_TEST_DIODE_CORNER}\n"
+                f"{DIODE_CORNER}\n"
             )
             f.write(
                 "lsl_buffer_test_square_margin_px: "
-                f"{LSL_BUFFER_TEST_DIODE_MARGIN}\n"
+                f"{DIODE_MARGIN}\n"
             )
 
         if lsl_buffer_test_mode:
