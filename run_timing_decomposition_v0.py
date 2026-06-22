@@ -78,7 +78,7 @@
 #   *_frame_intervals.csv, *.log -> standard PsychoPy diagnostics
 # =============================================================================
 
-from psychopy import visual, core, gui, logging
+from psychopy import visual, core, gui, logging, sound
 from psychopy import event as psychopy_event
 from psychopy.hardware import keyboard
 
@@ -125,14 +125,21 @@ DIODE_MARGIN = 40
 CADENCE_N        = 120
 CADENCE_INTERVAL = 0.500    # nominal software interval between markers (s)
 
-# --- marker code map (kept disjoint so blocks are separable offline) ----------
-# Per-flash markers are unique (base + global flash index) for 1:1 matching.
+# --- marker code map (all values ≤ 255 to fit the 8-bit g.TRIGbox/HIamp limit)
+# Flash codes encode the scheduling × luminance condition (9 combinations).
+# Timing-based matching is used for 1:1 flash ↔ marker alignment offline;
+# the condition code tells the analysis which cell each flash belongs to.
 START_MARKER          = 9      # matches the real task's startup marker
 END_MARKER            = 99     # matches the real task's end/abort marker
 BLOCK_MARKER_BASE     = 200    # position-block start = 200 + block_index
 CADENCE_START_MARKER  = 250
-FLASH_MARKER_BASE     = 1000   # flash markers: 1000 + flash_index_global
-CADENCE_MARKER_BASE   = 5000   # cadence markers: 5000 + cadence_index
+# Flash condition code = FLASH_CODE_OFFSET + sched_idx*3 + lum_idx  (10–18)
+FLASH_CODE_OFFSET     = 10
+# Cadence marker = CADENCE_MARKER_BASE + cadence_index  (101–220 for N=120)
+# Base 100 keeps codes above END_MARKER=99 and above flash codes 10–18.
+# Codes 200–202 overlap with BLOCK markers but only appear during the cadence
+# block (after CADENCE_START_MARKER=250), so timing disambiguates them.
+CADENCE_MARKER_BASE   = 100
 
 # --- reproducibility ----------------------------------------------------------
 DEFAULT_RNG_SEED = 20260622
@@ -169,6 +176,14 @@ def check_abort(kb):
     for k in keys:
         if k.name == QUIT_KEY:
             raise KeyboardInterrupt("Diagnostic aborted with ESCAPE.")
+
+
+def play_notification_beeps(n=4, freq=880, dur=0.45, gap=0.20):
+    """Play n short beeps to signal experiment end, audible from another room."""
+    snd = sound.Sound(value=freq, secs=dur, stereo=True, hamming=True)
+    for _ in range(n):
+        snd.play()
+        core.wait(dur + gap)
 
 
 def diode_xy(win, size, margin, h="right", v="bottom"):
@@ -343,7 +358,9 @@ def run_position_block(win, kb, trigger, text_stim, frame_counts, writer, f,
     flash_index = common_row["_flash_index_global"]
     for (rep_index, sched, lum) in schedule:
         flash_index += 1
-        marker_code = FLASH_MARKER_BASE + flash_index
+        sched_idx = SCHEDULING_LEVELS.index(sched)
+        lum_idx   = LUMINANCE_LEVELS.index(lum)
+        marker_code = FLASH_CODE_OFFSET + sched_idx * len(LUMINANCE_LEVELS) + lum_idx
         row = run_flash(win, kb, trigger, diode_stim, frame_counts,
                         sched, lum, marker_code)
         row.update({
@@ -523,9 +540,10 @@ def main():
             trigger = LSLTrigger(enabled=True,
                                  keepalive_hz=lsl_keepalive_hz,
                                  nominal_srate=lsl_nominal_srate)
-            print("LSL marker stream 'experiment_markers' created.")
-            input("\nOutlet live. Start the Simulink model, "
-                  "then press Enter when ready...")
+            print("LSL marker stream 'experiment_markers' created.", flush=True)
+            print("\nOutlet live. Start the Simulink model, "
+                  "then press Enter when ready...", flush=True)
+            input()
         else:
             trigger = LSLTrigger(enabled=False)
 
@@ -584,10 +602,12 @@ def main():
             f.write(f"block_marker_base: {BLOCK_MARKER_BASE} "
                     f"(position block start = base + block_index)\n")
             f.write(f"cadence_start_marker: {CADENCE_START_MARKER}\n")
-            f.write(f"flash_marker_base: {FLASH_MARKER_BASE} "
-                    f"(flash marker = base + flash_index_global)\n")
+            f.write(f"flash_code_offset: {FLASH_CODE_OFFSET} "
+                    f"(flash code = offset + sched_idx*3 + lum_idx; range {FLASH_CODE_OFFSET}–"
+                    f"{FLASH_CODE_OFFSET + len(SCHEDULING_LEVELS)*len(LUMINANCE_LEVELS) - 1})\n")
             f.write(f"cadence_marker_base: {CADENCE_MARKER_BASE} "
-                    f"(cadence marker = base + cadence_index)\n")
+                    f"(cadence marker = base + cadence_index; range "
+                    f"{CADENCE_MARKER_BASE + 1}–{CADENCE_MARKER_BASE + CADENCE_N})\n")
             f.write(f"lsl_keepalive_hz: {lsl_keepalive_hz}\n")
             f.write(f"lsl_nominal_srate: {lsl_nominal_srate}\n")
 
@@ -615,6 +635,7 @@ def main():
             trigger.set(END_MARKER)
             trigger.clear()
 
+        play_notification_beeps()
         text_stim.text = "Timing diagnostic complete.\n\nPress SPACE to exit."
         kb.clearEvents()
         psychopy_event.clearEvents()
@@ -635,6 +656,7 @@ def main():
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
         if trigger is not None:
             trigger.set(END_MARKER)
+        play_notification_beeps(n=6, freq=440)  # lower-pitched alarm for errors
     finally:
         if trigger is not None:
             trigger.clear()
