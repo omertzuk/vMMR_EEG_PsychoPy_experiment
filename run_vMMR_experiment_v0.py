@@ -913,11 +913,10 @@ def main():
                 keepalive_hz=lsl_keepalive_hz,
                 nominal_srate=lsl_nominal_srate,
             )
-            print("LSL marker stream 'experiment_markers' created.")
-            input(
-                "\nOutlet live. Start the Simulink model, "
-                "then press Enter when ready..."
-            )
+            print("LSL marker stream 'experiment_markers' created.", flush=True)
+            print("\nOutlet live. Start the Simulink model, "
+                  "then press Enter when ready...", flush=True)
+            input()
         else:
             trigger = EEGTrigger(enabled=send_eeg_triggers,
                                  address=exp_info["parallel_port_address"])
