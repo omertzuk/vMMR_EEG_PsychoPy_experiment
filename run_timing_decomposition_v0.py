@@ -116,21 +116,34 @@ POSITIONS = [
     {"label": "bottom_right", "h": "right", "v": "bottom"},
 ]
 
-# --- patch geometry (pixels) -- matches run_vMMR_experiment_v0.py so the -------
-# bottom_right block transfers directly to the real experiment.
+# --- patch geometry (pixels) -------------------------------------------------
+# DIODE_SIZE / DIODE_MARGIN match run_vMMR_experiment_v0.py exactly so the
+# bottom_right block gives the real-task diode-to-face offset.
 DIODE_SIZE   = 45
 DIODE_MARGIN = 40
+# Diagnostic runs use a larger patch: easier to land the optical sensor on and
+# crosses the g.TRIGbox threshold reliably across luminance levels. The rising
+# edge still reflects the patch TOP crossing threshold, so scan-out/transfer to
+# the 45 px task patch is approximate (not exact).
+DIODE_SIZE_DIAGNOSTIC = 200
 
 # --- cadence (display-independent LSL/Simulink jitter) block ------------------
 CADENCE_N        = 120
 CADENCE_INTERVAL = 0.500    # nominal software interval between markers (s)
+
+# --- threshold-tuning mode (display only, no factorial) ----------------------
+TUNING_CYCLES    = 60
+TUNING_ON_DUR    = 1.000   # seconds
+TUNING_OFF_DUR   = 1.000   # seconds
+TUNING_LUMINANCE = 1.00    # fraction of full white
+TUNING_MARKER    = 60      # code pushed on each ON onset (fits in 8 bits, unused elsewhere)
 
 # --- marker code map (all values ≤ 255 to fit the 8-bit g.TRIGbox/HIamp limit)
 # Flash codes encode the scheduling × luminance condition (9 combinations).
 # Timing-based matching is used for 1:1 flash ↔ marker alignment offline;
 # the condition code tells the analysis which cell each flash belongs to.
 START_MARKER          = 9      # matches the real task's startup marker
-END_MARKER            = 99     # matches the real task's end/abort marker
+END_MARKER            = 255    # end/abort marker; max 8-bit value, unmistakable
 BLOCK_MARKER_BASE     = 200    # position-block start = 200 + block_index
 CADENCE_START_MARKER  = 250
 # Flash condition code = FLASH_CODE_OFFSET + sched_idx*3 + lum_idx  (10–18)
@@ -258,10 +271,8 @@ def run_flash(win, kb, trigger, diode_stim, frame_counts,
               scheduling, luminance_frac, marker_code):
     """Present one diode flash under the given scheduling + luminance and return
     a log dict. The patch is drawn for the whole ON period; the marker is pushed
-    on the onset flip with timing determined by `scheduling`; the marker channel
-    is cleared on the following flip to mirror the real task's 1-frame pulse.
-
-    The keepalive thread keeps running throughout (representative of the task).
+    on the onset flip with timing determined by `scheduling`. The latched
+    lsl_trigger auto-expires the code; no explicit clear is issued here.
     """
     scalar = luminance_to_scalar(luminance_frac)
     diode_stim.fillColor = scalar
@@ -289,7 +300,6 @@ def run_flash(win, kb, trigger, diode_stim, frame_counts,
             actual_flip_time = win.flip()
             if scheduling == "POST_FLIP":
                 _push()                        # pushed after the swap returns
-            win.callOnFlip(trigger.clear)      # clear on the NEXT flip
         else:
             win.flip()
         check_abort(kb)
@@ -331,9 +341,9 @@ def run_position_block(win, kb, trigger, text_stim, frame_counts, writer, f,
     """Run one between-block POSITION level: an alignment screen, a black
     baseline, then reps_per_cell flashes of every (scheduling x luminance) cell
     in randomised order. Returns the running global flash index."""
-    x, y = diode_xy(win, DIODE_SIZE, DIODE_MARGIN,
+    x, y = diode_xy(win, DIODE_SIZE_DIAGNOSTIC, DIODE_MARGIN,
                     h=position["h"], v=position["v"])
-    diode_stim = visual.Rect(win, width=DIODE_SIZE, height=DIODE_SIZE,
+    diode_stim = visual.Rect(win, width=DIODE_SIZE_DIAGNOSTIC, height=DIODE_SIZE_DIAGNOSTIC,
                              pos=(x, y), units="pix")
 
     show_alignment_screen(win, kb, text_stim, diode_stim, position["label"])
@@ -341,7 +351,6 @@ def run_position_block(win, kb, trigger, text_stim, frame_counts, writer, f,
     # mark the block boundary in the stream
     if trigger is not None:
         trigger.set(BLOCK_MARKER_BASE + block_index)
-        trigger.clear()
 
     win.recordFrameIntervals = True
     black_frames(win, kb, frame_counts["initial_black"])
@@ -398,7 +407,6 @@ def run_cadence_block(win, kb, trigger, base_path, meta):
 
     if trigger is not None:
         trigger.set(CADENCE_START_MARKER)
-        trigger.clear()
 
     # settle on a black screen first
     win.flip()
@@ -423,8 +431,6 @@ def run_cadence_block(win, kb, trigger, base_path, meta):
             psy = logging.defaultClock.getTime()
             lsl = trigger.set_with_timestamp(marker_code) \
                 if trigger is not None else None
-            if trigger is not None:
-                trigger.clear()
 
             measured = None if prev_push is None else (psy - prev_push)
             prev_push = psy
@@ -445,7 +451,64 @@ def run_cadence_block(win, kb, trigger, base_path, meta):
 
 
 # =============================================================================
-# 6. OUTPUT WRITER (position-block flashes)
+# 6. THRESHOLD-TUNING MODE
+# =============================================================================
+
+def run_threshold_tuning(win, kb, trigger, frame_rate):
+    """Flash a large full-white patch repeatedly so the operator can adjust the
+    g.TRIGbox sensitivity until its LED tracks every ON/OFF cycle reliably."""
+    def n_frames(s):
+        return max(1, int(round(s * frame_rate)))
+
+    on_frames  = n_frames(TUNING_ON_DUR)
+    off_frames = n_frames(TUNING_OFF_DUR)
+
+    x, y = diode_xy(win, DIODE_SIZE_DIAGNOSTIC, DIODE_MARGIN, h="right", v="bottom")
+    diode_stim = visual.Rect(win, width=DIODE_SIZE_DIAGNOSTIC, height=DIODE_SIZE_DIAGNOSTIC,
+                             pos=(x, y), units="pix")
+    scalar = luminance_to_scalar(TUNING_LUMINANCE)
+    diode_stim.fillColor = scalar
+    diode_stim.lineColor = scalar
+
+    instr = visual.TextStim(
+        win,
+        text=(
+            "THRESHOLD TUNING — Watch the g.TRIGbox indicator LED.\n"
+            "Adjust its sensitivity/threshold until the LED turns ON for every\n"
+            "white square and OFF for every black gap.\n\n"
+            "SPACE to begin, ESC to stop."
+        ),
+        pos=(0, 0), height=30, color="white", units="pix", wrapWidth=1000,
+    )
+
+    kb.clearEvents()
+    psychopy_event.clearEvents()
+    waiting = True
+    while waiting:
+        instr.draw()
+        win.flip()
+        check_escape()
+        keys = kb.getKeys(keyList=["space", QUIT_KEY], waitRelease=False, clear=True)
+        for k in keys:
+            if k.name == QUIT_KEY:
+                raise KeyboardInterrupt("Diagnostic aborted with ESCAPE.")
+            if k.name == "space":
+                waiting = False
+
+    for _ in range(TUNING_CYCLES):
+        for frame_n in range(on_frames):
+            diode_stim.draw()
+            if frame_n == 0:
+                win.callOnFlip(trigger.set, TUNING_MARKER)
+            win.flip()
+            check_abort(kb)
+        for _ in range(off_frames):
+            win.flip()
+            check_abort(kb)
+
+
+# =============================================================================
+# 7. OUTPUT WRITER (position-block flashes)
 # =============================================================================
 
 def make_flash_writer(path, meta_keys):
@@ -473,7 +536,7 @@ def write_frame_intervals(win, path):
 
 
 # =============================================================================
-# 7. MAIN
+# 8. MAIN
 # =============================================================================
 
 def main():
@@ -486,6 +549,7 @@ def main():
         "session": "001",
         "fullscreen": True,
         "send_LSL_triggers": True,
+        "threshold_tuning_mode": False,
         "run_position_blocks": True,
         "run_cadence_block": True,
         "reps_per_cell": REPS_PER_CELL,
@@ -496,16 +560,17 @@ def main():
     dlg = gui.DlgFromDict(
         exp_info, title="vMMR timing decomposition",
         order=["participant", "session", "fullscreen", "send_LSL_triggers",
-               "run_position_blocks", "run_cadence_block", "reps_per_cell",
-               "rng_seed", "lsl_keepalive_hz", "lsl_nominal_srate"])
+               "threshold_tuning_mode", "run_position_blocks", "run_cadence_block",
+               "reps_per_cell", "rng_seed", "lsl_keepalive_hz", "lsl_nominal_srate"])
     if not dlg.OK:
         core.quit()
 
-    participant         = exp_info["participant"]
-    session             = exp_info["session"]
-    fullscreen          = bool(exp_info["fullscreen"])
-    send_lsl_triggers   = bool(exp_info["send_LSL_triggers"])
-    do_position_blocks  = bool(exp_info["run_position_blocks"])
+    participant           = exp_info["participant"]
+    session               = exp_info["session"]
+    fullscreen            = bool(exp_info["fullscreen"])
+    send_lsl_triggers     = bool(exp_info["send_LSL_triggers"])
+    threshold_tuning_mode = bool(exp_info["threshold_tuning_mode"])
+    do_position_blocks    = bool(exp_info["run_position_blocks"])
     do_cadence_block    = bool(exp_info["run_cadence_block"])
     reps_per_cell       = to_int(exp_info["reps_per_cell"], default=REPS_PER_CELL)
     rng_seed            = to_int(exp_info["rng_seed"], default=DEFAULT_RNG_SEED)
@@ -585,6 +650,7 @@ def main():
             for k, v in frame_counts.items():
                 f.write(f"frames[{k}]: {v}\n")
             f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
+            f.write(f"threshold_tuning_mode: {threshold_tuning_mode}\n")
             f.write(f"run_position_blocks: {do_position_blocks}\n")
             f.write(f"run_cadence_block: {do_cadence_block}\n")
             f.write(f"reps_per_cell: {reps_per_cell}\n")
@@ -593,7 +659,13 @@ def main():
             f.write(f"luminance_levels: {LUMINANCE_LEVELS}\n")
             f.write(f"positions: {[p['label'] for p in POSITIONS]}\n")
             f.write(f"patch_size_px: {DIODE_SIZE}\n")
+            f.write(f"patch_size_diagnostic_px: {DIODE_SIZE_DIAGNOSTIC}\n")
             f.write(f"patch_margin_px: {DIODE_MARGIN}\n")
+            f.write(f"tuning_cycles: {TUNING_CYCLES}\n")
+            f.write(f"tuning_on_dur: {TUNING_ON_DUR}\n")
+            f.write(f"tuning_off_dur: {TUNING_OFF_DUR}\n")
+            f.write(f"tuning_luminance: {TUNING_LUMINANCE}\n")
+            f.write(f"tuning_marker: {TUNING_MARKER}\n")
             f.write(f"on_duration: {ON_DUR}\noff_duration: {OFF_DUR}\n")
             f.write(f"cadence_n: {CADENCE_N}\n")
             f.write(f"cadence_interval: {CADENCE_INTERVAL}\n")
@@ -614,7 +686,13 @@ def main():
         # --- start marker ----------------------------------------------------
         if trigger is not None:
             trigger.set(START_MARKER)
-            trigger.clear()
+
+        # --- threshold-tuning shortcut (iterate on knob, then re-run) --------
+        if threshold_tuning_mode:
+            run_threshold_tuning(win, kb, trigger, frame_rate)
+            if trigger is not None:
+                trigger.set(END_MARKER)
+            return
 
         # --- position blocks -------------------------------------------------
         if do_position_blocks:
@@ -633,7 +711,6 @@ def main():
         # --- end marker ------------------------------------------------------
         if trigger is not None:
             trigger.set(END_MARKER)
-            trigger.clear()
 
         play_notification_beeps()
         text_stim.text = "Timing diagnostic complete.\n\nPress SPACE to exit."
