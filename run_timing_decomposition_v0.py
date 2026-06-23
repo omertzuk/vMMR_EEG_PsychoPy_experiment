@@ -116,6 +116,13 @@ POSITIONS = [
     {"label": "bottom_right", "h": "right", "v": "bottom"},
 ]
 
+# --- latency-only mode (single condition, no factorial) ----------------------
+LATENCY_N_FLASHES  = 200
+LATENCY_LUMINANCE  = 1.00
+LATENCY_SCHEDULING = "ON_FLIP"
+LATENCY_POSITION   = {"label": "bottom_right", "h": "right", "v": "bottom"}
+LATENCY_MARKER     = 20           # distinct from flash codes 10–18
+
 # --- patch geometry (pixels) -------------------------------------------------
 # DIODE_SIZE / DIODE_MARGIN match run_vMMR_experiment_v0.py exactly so the
 # bottom_right block gives the real-task diode-to-face offset.
@@ -451,7 +458,49 @@ def run_cadence_block(win, kb, trigger, base_path, meta):
 
 
 # =============================================================================
-# 6. THRESHOLD-TUNING MODE
+# 6. LATENCY-ONLY BLOCK  (single condition: ON_FLIP + full white + bottom_right)
+# =============================================================================
+
+def run_latency_block(win, kb, trigger, text_stim, frame_counts, writer, f, meta):
+    """Measure the PsychoPy-trigger -> white-square delay for a single condition.
+    No luminance or position factors; just LATENCY_N_FLASHES ON_FLIP flashes at
+    the bottom-right position so the result plugs directly into the real task.
+    """
+    x, y = diode_xy(win, DIODE_SIZE_DIAGNOSTIC, DIODE_MARGIN,
+                    h=LATENCY_POSITION["h"], v=LATENCY_POSITION["v"])
+    diode_stim = visual.Rect(win, width=DIODE_SIZE_DIAGNOSTIC,
+                             height=DIODE_SIZE_DIAGNOSTIC,
+                             pos=(x, y), units="pix")
+
+    show_alignment_screen(win, kb, text_stim, diode_stim, LATENCY_POSITION["label"])
+
+    if trigger is not None:
+        trigger.set(BLOCK_MARKER_BASE + 0)
+
+    win.recordFrameIntervals = True
+    black_frames(win, kb, frame_counts["initial_black"])
+
+    for i in range(1, LATENCY_N_FLASHES + 1):
+        row = run_flash(win, kb, trigger, diode_stim, frame_counts,
+                        LATENCY_SCHEDULING, LATENCY_LUMINANCE, LATENCY_MARKER)
+        row.update({
+            "block_type": "LATENCY",
+            "position_label": LATENCY_POSITION["label"],
+            "patch_x": x,
+            "patch_y": y,
+            "rep_index": i,
+            "flash_index_global": i,
+            "notes": "latency_only_mode",
+        })
+        row.update(meta)
+        writer.writerow(row)
+        f.flush()
+
+    win.recordFrameIntervals = False
+
+
+# =============================================================================
+# 8. THRESHOLD-TUNING MODE
 # =============================================================================
 
 def run_threshold_tuning(win, kb, trigger, frame_rate):
@@ -508,7 +557,7 @@ def run_threshold_tuning(win, kb, trigger, frame_rate):
 
 
 # =============================================================================
-# 7. OUTPUT WRITER (position-block flashes)
+# 9. OUTPUT WRITER (position-block flashes)
 # =============================================================================
 
 def make_flash_writer(path, meta_keys):
@@ -536,7 +585,7 @@ def write_frame_intervals(win, path):
 
 
 # =============================================================================
-# 8. MAIN
+# 10. MAIN
 # =============================================================================
 
 def main():
@@ -550,6 +599,7 @@ def main():
         "fullscreen": True,
         "send_LSL_triggers": True,
         "threshold_tuning_mode": False,
+        "latency_only_mode": False,
         "run_position_blocks": True,
         "run_cadence_block": True,
         "reps_per_cell": REPS_PER_CELL,
@@ -560,7 +610,8 @@ def main():
     dlg = gui.DlgFromDict(
         exp_info, title="vMMR timing decomposition",
         order=["participant", "session", "fullscreen", "send_LSL_triggers",
-               "threshold_tuning_mode", "run_position_blocks", "run_cadence_block",
+               "threshold_tuning_mode", "latency_only_mode",
+               "run_position_blocks", "run_cadence_block",
                "reps_per_cell", "rng_seed", "lsl_keepalive_hz", "lsl_nominal_srate"])
     if not dlg.OK:
         core.quit()
@@ -570,6 +621,7 @@ def main():
     fullscreen            = bool(exp_info["fullscreen"])
     send_lsl_triggers     = bool(exp_info["send_LSL_triggers"])
     threshold_tuning_mode = bool(exp_info["threshold_tuning_mode"])
+    latency_only_mode     = bool(exp_info["latency_only_mode"])
     do_position_blocks    = bool(exp_info["run_position_blocks"])
     do_cadence_block    = bool(exp_info["run_cadence_block"])
     reps_per_cell       = to_int(exp_info["reps_per_cell"], default=REPS_PER_CELL)
@@ -651,6 +703,12 @@ def main():
                 f.write(f"frames[{k}]: {v}\n")
             f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
             f.write(f"threshold_tuning_mode: {threshold_tuning_mode}\n")
+            f.write(f"latency_only_mode: {latency_only_mode}\n")
+            f.write(f"latency_n_flashes: {LATENCY_N_FLASHES}\n")
+            f.write(f"latency_luminance: {LATENCY_LUMINANCE}\n")
+            f.write(f"latency_scheduling: {LATENCY_SCHEDULING}\n")
+            f.write(f"latency_position: {LATENCY_POSITION['label']}\n")
+            f.write(f"latency_marker: {LATENCY_MARKER}\n")
             f.write(f"run_position_blocks: {do_position_blocks}\n")
             f.write(f"run_cadence_block: {do_cadence_block}\n")
             f.write(f"reps_per_cell: {reps_per_cell}\n")
@@ -690,6 +748,16 @@ def main():
         # --- threshold-tuning shortcut (iterate on knob, then re-run) --------
         if threshold_tuning_mode:
             run_threshold_tuning(win, kb, trigger, frame_rate)
+            if trigger is not None:
+                trigger.set(END_MARKER)
+            return
+
+        # --- latency-only shortcut (single condition, no factorial) ----------
+        if latency_only_mode:
+            flash_writer, flash_f = make_flash_writer(
+                str(base) + "_timing_decomposition.csv", meta.keys())
+            run_latency_block(win, kb, trigger, text_stim, frame_counts,
+                              flash_writer, flash_f, meta)
             if trigger is not None:
                 trigger.set(END_MARKER)
             return
