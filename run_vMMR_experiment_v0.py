@@ -21,6 +21,12 @@ from psychopy import visual, core, gui, logging
 from psychopy import event as psychopy_event
 from psychopy.hardware import keyboard
 
+try:
+    import psychtoolbox  # noqa: F401
+    HAS_PSYCHTOOLBOX = True
+except Exception:
+    HAS_PSYCHTOOLBOX = False
+
 # psychopy.parallel may be unavailable on machines with no parallel port
 # (e.g. when developing on a laptop). Import defensively so dry runs still work.
 try:
@@ -409,11 +415,33 @@ def collect_presses(kb, presses):
     """
     check_escape()
 
+    if not HAS_PSYCHTOOLBOX:
+        # PsychoPy falls back to the older event module when psychtoolbox is not
+        # installed. In that mode, polling keyboard.Keyboard first can consume
+        # events before event.getKeys sees them on some macOS setups.
+        for name, rt in psychopy_event.getKeys(
+                keyList=RESPONSE_KEYS + [QUIT_KEY], timeStamped=kb.clock):
+            if name == QUIT_KEY:
+                raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+            if name in RESPONSE_KEYS:
+                presses.append((name, rt))
+        return
+
     keys = kb.getKeys(
         keyList=RESPONSE_KEYS + [QUIT_KEY],
         waitRelease=False,
         clear=True
     )
+    if not keys:
+        # Fallback for systems where psychopy.hardware.keyboard does not receive
+        # key events from the PsychoPy window, seen on some laptop/macOS setups.
+        for name, rt in psychopy_event.getKeys(
+                keyList=RESPONSE_KEYS + [QUIT_KEY], timeStamped=kb.clock):
+            if name == QUIT_KEY:
+                raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+            if name in RESPONSE_KEYS:
+                presses.append((name, rt))
+        return
 
     for k in keys:
         if k.name == QUIT_KEY:
@@ -460,19 +488,26 @@ def show_text_and_wait(win, kb, text_stim, message,
 
         check_escape()
 
-        keys = kb.getKeys(
-            keyList=list(allowed_keys) + [QUIT_KEY],
-            waitRelease=False,
-            clear=True
-        )
+        if HAS_PSYCHTOOLBOX:
+            keys = kb.getKeys(
+                keyList=list(allowed_keys) + [QUIT_KEY],
+                waitRelease=False,
+                clear=True
+            )
+            key_names = [k.name for k in keys]
+            if not key_names:
+                key_names = psychopy_event.getKeys(
+                    keyList=list(allowed_keys) + [QUIT_KEY])
+        else:
+            key_names = psychopy_event.getKeys(
+                keyList=list(allowed_keys) + [QUIT_KEY])
 
-        for k in keys:
-            if k.name == QUIT_KEY:
-                raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+        if QUIT_KEY in key_names:
+            raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
 
         if wait_clock.getTime() >= min_wait:
-            for k in keys:
-                if k.name in allowed_keys:
+            for name in key_names:
+                if name in allowed_keys:
                     return
 
 
