@@ -16,13 +16,16 @@
 #     latency  = mean(delay)      jitter = SD(delay)
 #
 # Design choices (from the October 2026 repo audit):
-#   * Rig (October 2026): 120 Hz stimulus display; Simulink on a second PC
+#   * Rig (October 2026): 1920 x 1080 stimulus display at 59.94 Hz (frame
+#     counts use 59.94, so 100 ms = 6 frames and the 16.7 ms step = 1 frame
+#     = 16.683 ms; reported durations are frames / 59.94); Simulink on a second PC
 #     records g.HIamp + LSL markers at 600 Hz and stops when the marker
 #     reaches 255. All codes here are small except END_MARKER = 255, sent
 #     once at the end (or on abort) to stop the recording.
 #   * LSL keepalive and nominal rate default to 600 Hz to match the Simulink
-#     inlet. The keepalive must not push faster than the inlet consumes, or
-#     samples may queue up and delay the recorded markers.
+#     inlet. The inlet consumes one sample per model step, so the sample rate
+#     paces the model: lsl_trigger.py counts samples against the clock to send
+#     exactly 600/s, and the achieved rate is written to run_info at the end.
 #   * A dark/light calibration segment is recorded first, so the analysis can
 #     determine the photodiode channel's polarity (it may idle HIGH) instead of
 #     assuming that 0 -> 1 means "square on".
@@ -94,6 +97,11 @@ PREVIEW_ON  = 0.500
 PREVIEW_OFF = 0.500
 
 REFRESH_TOLERANCE = 0.02       # abort if measured differs > 2 % from expected
+EXPECTED_REFRESH_HZ = 59.94    # stimulus PC display mode
+
+# Stimulus display resolution (window size in pixels)
+SCREEN_WIDTH_PX  = 1920
+SCREEN_HEIGHT_PX = 1080
 
 # --- marker codes (all flip-aligned except START and END) -------------------
 START_MARKER    = 9            # run start (not flip-aligned)
@@ -261,7 +269,7 @@ def main():
         "session": "001",
         "fullscreen": True,
         "screen_index": 0,
-        "expected_refresh_hz": 120,
+        "expected_refresh_hz": EXPECTED_REFRESH_HZ,
         "send_LSL_triggers": True,
         "n_flashes": N_FLASHES_DEFAULT,
         "on_start_ms": ON_START_MS,
@@ -280,7 +288,7 @@ def main():
     session     = info["session"]
     fullscreen  = bool(info["fullscreen"])
     screen_idx  = to_int(info["screen_index"], 0)
-    expected_hz = to_float(info["expected_refresh_hz"], 120.0)
+    expected_hz = to_float(info["expected_refresh_hz"], EXPECTED_REFRESH_HZ)
     send_lsl    = bool(info["send_LSL_triggers"])
     n_flashes   = to_int(info["n_flashes"], N_FLASHES_DEFAULT)
     on_start_ms = to_float(info["on_start_ms"], ON_START_MS)
@@ -317,7 +325,8 @@ def main():
             input()
 
         # --- window -----------------------------------------------------------
-        win = visual.Window(size=(1200, 800), fullscr=fullscreen,
+        win = visual.Window(size=(SCREEN_WIDTH_PX, SCREEN_HEIGHT_PX),
+                            fullscr=fullscreen,
                             screen=screen_idx, units="pix", color="black",
                             allowGUI=not fullscreen, waitBlanking=True)
         win.mouseVisible = False
@@ -362,6 +371,8 @@ def main():
             for k, v in info.items():
                 f.write(f"{k}: {v}\n")
             f.write(f"timestamp: {stamp}\n")
+            f.write(f"screen_width_px: {SCREEN_WIDTH_PX}\n")
+            f.write(f"screen_height_px: {SCREEN_HEIGHT_PX}\n")
             f.write(f"window_size_px: {list(win.size)}\n")
             f.write(f"measured_refresh_hz: {measured_hz}\n")
             for k, v in frame_counts.items():
@@ -432,6 +443,21 @@ def main():
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
     finally:
         if trigger is not None:
+            # Achieved LSL sample rate (it paces the Simulink model). Read it
+            # before finish() stops the keepalive; guarded so a failure here
+            # cannot skip finish() or the file saves.
+            try:
+                stats = trigger.stats()
+                print(f"lsl_rate_hz: {stats['rate_hz']}", flush=True)
+                run_info_path = Path(str(base) + "_run_info.txt")
+                if run_info_path.exists():
+                    with open(run_info_path, "a", encoding="utf-8") as f:
+                        f.write(f"lsl_samples_sent: {stats['samples_sent']}\n")
+                        f.write(f"lsl_seconds: {stats['seconds']}\n")
+                        f.write(f"lsl_rate_hz: {stats['rate_hz']}\n")
+                        f.write(f"lsl_resyncs: {stats['resyncs']}\n")
+            except Exception as e:
+                logging.error(f"LSL rate report problem: {e}")
             trigger.hold_duration = 0.100         # short latch for END_MARKER
             # Latch END_MARKER for hold_duration, return to 0, stop once.
             # Guarded so a stuck keepalive thread cannot skip the file saves.

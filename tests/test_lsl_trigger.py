@@ -149,3 +149,110 @@ def test_finish_holds_final_marker_then_clears_and_is_idempotent(lsl_module):
     trigger.finish(final_code=99, margin=margin)
     trigger.stop()
     trigger.stop()
+
+
+# --- exact-rate keepalive -----------------------------------------------------
+
+def patch_min_wait(monkeypatch, min_wait):
+    """Make every Event.wait(timeout) last at least min_wait (like Windows)."""
+    original_wait = threading.Event.wait
+
+    def slow_wait(self, timeout=None):
+        if timeout is not None:
+            timeout = max(float(timeout), min_wait)
+        return original_wait(self, timeout)
+
+    monkeypatch.setattr(threading.Event, "wait", slow_wait)
+
+
+@pytest.mark.parametrize("min_wait", [0.002, 0.015])
+def test_keepalive_delivers_exact_rate_with_slow_sleeps(
+        lsl_module, monkeypatch, min_wait):
+    patch_min_wait(monkeypatch, min_wait)
+    trigger = lsl_module.LSLTrigger(enabled=True, keepalive_hz=600,
+                                    nominal_srate=600, hold_duration=0.100)
+    try:
+        for _ in range(20):                 # ~20 set() calls during ~3 s
+            time.sleep(0.150)
+            trigger.set(20)
+        stats = trigger.stats()
+    finally:
+        trigger.stop()
+
+    assert stats["seconds"] >= 2.9
+    assert stats["rate_hz"] == pytest.approx(600.0, rel=0.01)
+    assert stats["samples_sent"] == len(trigger.outlet.snapshot())
+
+
+@pytest.mark.parametrize("min_wait", [None, 0.015])
+def test_set_plateau_matches_hold_duration_in_samples(
+        lsl_module, monkeypatch, min_wait):
+    if min_wait is not None:
+        patch_min_wait(monkeypatch, min_wait)
+    trigger = lsl_module.LSLTrigger(enabled=True, keepalive_hz=600,
+                                    nominal_srate=600, hold_duration=0.100)
+    try:
+        time.sleep(0.050)
+        trigger.set(42)
+        time.sleep(0.250)
+    finally:
+        trigger.stop()
+
+    values = [s["value"] for s in trigger.outlet.snapshot()]
+    onset = values.index(42)
+    plateau = 0
+    while onset + plateau < len(values) and values[onset + plateau] == 42:
+        plateau += 1
+    assert abs(plateau - 60) <= 6
+    assert values[onset + plateau] == 0
+
+
+def test_stall_longer_than_max_catchup_resyncs_without_burst(lsl_module):
+    trigger = lsl_module.LSLTrigger(enabled=True, keepalive_hz=600,
+                                    nominal_srate=600)
+    offset = [0.0]
+    trigger._local_clock = lambda: time.monotonic() + offset[0]
+    try:
+        assert wait_until(lambda: len(trigger.outlet.snapshot()) > 10)
+        resyncs_before = trigger.stats()["resyncs"]
+        with trigger._lock:                 # simulate a 0.5 s stall
+            n_before = len(trigger.outlet.snapshot())
+            offset[0] += 5 * lsl_module._MAX_CATCHUP_S
+        assert wait_until(
+            lambda: trigger.stats()["resyncs"] > resyncs_before)
+        with trigger._lock:
+            n_after = len(trigger.outlet.snapshot())
+    finally:
+        trigger.stop()
+
+    # A burst would be ~300 samples; the resync wake-up pushes one sample
+    # (allow for one or two ordinary wake-ups before the lock is retaken).
+    assert 1 <= n_after - n_before <= 4
+
+
+def test_finish_latches_255_returns_to_zero_and_stops(lsl_module):
+    trigger = lsl_module.LSLTrigger(enabled=True, keepalive_hz=600,
+                                    nominal_srate=600)
+    trigger.finish()
+    values = [s["value"] for s in trigger.outlet.snapshot()]
+    assert 255 in values
+    assert 0 in values[values.index(255):]
+    assert values[-1] == 0
+    assert trigger._keepalive_thread is None
+
+    trigger.finish()
+    trigger.stop()
+    trigger.finish()
+    assert trigger.stats()["samples_sent"] == len(trigger.outlet.snapshot())
+
+
+def test_disabled_trigger_is_noop(lsl_module):
+    trigger = lsl_module.LSLTrigger(enabled=False)
+    assert trigger.set_with_timestamp(11) is None
+    trigger.set(11)
+    trigger.clear()
+    trigger.finish()
+    trigger.stop()
+    assert trigger.stats() == {"samples_sent": None, "seconds": None,
+                               "rate_hz": None, "resyncs": None}
+    assert FakeStreamOutlet.instances == []

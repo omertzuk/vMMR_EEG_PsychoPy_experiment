@@ -22,6 +22,26 @@ CONSTRAINT on hold_duration:
 
 Do NOT call clear() one frame after set() anymore: that recreates the
 transient. Let hold_duration handle the return to 0.
+
+SAMPLE RATE PACES THE SIMULINK MODEL:
+  The inlet waits for one marker sample on every model step, so the number of
+  samples this outlet sends per second sets the pace of the whole Simulink
+  model. Too few samples -> the model runs slower than real time (marker
+  durations look compressed, amplifier data lags and is dropped); too many ->
+  samples queue up and the recorded markers are delayed.
+
+  A plain "push, then sleep 1/keepalive_hz" loop under-delivers on Windows,
+  where sleeps last longer than requested (about 500 samples/s when 600 are
+  requested). The keepalive therefore counts samples against the clock: on
+  every wake-up it pushes as many samples as are due since _t0, so it catches
+  up after a long sleep and delivers exactly keepalive_hz samples/s on
+  average. Every push (keepalive, set, clear) is counted. set() and clear()
+  first send the samples still owed with the OLD value, so the new code lands
+  at the stream position matching its real time, and each catch-up sample is
+  given the value that was valid at its own scheduled time (latch expiry is
+  resolved per sample, not per wake-up). After a stall longer than
+  _MAX_CATCHUP_S the counter is reset instead of sending a large burst;
+  stats()["resyncs"] counts these resets.
 """
 
 import threading
@@ -35,6 +55,7 @@ _KEEPALIVE_HZ  = 600.0
 _NOMINAL_SRATE = 600.0
 _END_CODE      = 255     # the Simulink model stops recording on this code
 _HOLD_DURATION = 0.100   # 0 < consumer_period << hold << min_event_gap
+_MAX_CATCHUP_S = 0.100   # longer gaps are resynced, not sent as a burst
 
 
 class LSLTrigger:
@@ -59,6 +80,13 @@ class LSLTrigger:
         self._lifecycle_lock = threading.Lock()
         self._finished = False
         self._stopped = False
+        # Sample counting (all guarded by _lock). _pushed counts samples since
+        # _t0; _total_pushed counts samples since _start_time.
+        self._t0 = None
+        self._pushed = 0
+        self._total_pushed = 0
+        self._start_time = None
+        self._resyncs = 0
 
         if not self.enabled:
             return
@@ -97,17 +125,53 @@ class LSLTrigger:
                                                    daemon=True)
         self._keepalive_thread.start()
 
+    def _start_counting(self, now):
+        """Start the sample clock. Call with _lock held."""
+        self._t0 = self._start_time = now
+        self._pushed = 0
+        self._total_pushed = 0
+        self._resyncs = 0
+
+    def _push_due(self, now, include_now=True):
+        """Push every sample due by `now` (exclusive of the `now` slot when
+        include_now is False). Each sample carries the value valid at its own
+        scheduled time, so the latch expires at the right stream position even
+        when a wake-up is late. Call with _lock held."""
+        if self._t0 is None:
+            self._start_counting(now)
+        due = int((now - self._t0) * self.keepalive_hz) + 1 - self._pushed
+        if not include_now:
+            due -= 1
+        max_due = max(1, int(_MAX_CATCHUP_S * self.keepalive_hz))
+        if due > max_due:
+            # Stalled too long: restart the count instead of sending a burst.
+            self._t0 = now
+            self._pushed = 0
+            due = 1 if include_now else 0
+            self._resyncs += 1
+        for _ in range(max(0, due)):
+            slot_time = self._t0 + self._pushed / self.keepalive_hz
+            if self._expiry is not None and slot_time >= self._expiry:
+                self._current_value = 0
+                self._expiry = None
+            self.outlet.push_sample([self._current_value], pushthrough=True)
+            self._pushed += 1
+            self._total_pushed += 1
+        if self._expiry is not None and now >= self._expiry:
+            self._current_value = 0
+            self._expiry = None
+
     def _keepalive(self):
         interval = 1.0 / self.keepalive_hz
         outlet = self.outlet
         if outlet is None:
             return
+        with self._lock:
+            if self._t0 is None:
+                self._start_counting(self._local_clock())
         while not self._stop_event.is_set():
             with self._lock:
-                if self._expiry is not None and self._local_clock() >= self._expiry:
-                    self._current_value = 0
-                    self._expiry = None
-                outlet.push_sample([self._current_value], pushthrough=True)
+                self._push_due(self._local_clock())
             self._stop_event.wait(interval)
 
     def set_with_timestamp(self, code):
@@ -116,11 +180,16 @@ class LSLTrigger:
         value = int(code)
         with self._lock:
             timestamp = self._local_clock()
+            # Send the samples still owed with the old value first, so the
+            # code sample sits at the stream position of `timestamp`.
+            self._push_due(timestamp, include_now=False)
             self._current_value = value
             self._expiry = timestamp + self.hold_duration
             self.outlet.push_sample(
                 [value], timestamp=timestamp, pushthrough=True
             )
+            self._pushed += 1
+            self._total_pushed += 1
         return timestamp
 
     def set(self, code):
@@ -130,9 +199,26 @@ class LSLTrigger:
         if self.outlet is None:
             return
         with self._lock:
+            self._push_due(self._local_clock(), include_now=False)
             self._current_value = 0
             self._expiry = None
             self.outlet.push_sample([0], pushthrough=True)
+            self._pushed += 1
+            self._total_pushed += 1
+
+    def stats(self):
+        """Samples sent since the keepalive started and the average rate.
+        All values are None when the outlet is disabled."""
+        if self.outlet is None or self._start_time is None:
+            return {"samples_sent": None, "seconds": None,
+                    "rate_hz": None, "resyncs": None}
+        with self._lock:
+            total = self._total_pushed
+            elapsed = self._local_clock() - self._start_time
+            resyncs = self._resyncs
+        return {"samples_sent": total, "seconds": elapsed,
+                "rate_hz": total / elapsed if elapsed > 0 else None,
+                "resyncs": resyncs}
 
     def wait_for_consumers(self, timeout=15.0):
         """Wait for an inlet when supported; return None on older pylsl."""
