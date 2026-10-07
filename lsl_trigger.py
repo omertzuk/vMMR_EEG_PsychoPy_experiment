@@ -15,7 +15,7 @@ Detect events offline as LEADING EDGES, not by counting nonzero samples.
 
 CONSTRAINT on hold_duration:
   - LONGER than one consumer sample period, so the code is sampled at least
-    once (at any model rate >= ~60 Hz the 0.100 s default spans many samples);
+    once (at the 600 Hz model rate the 0.100 s default spans ~60 samples);
   - SHORTER than the minimum gap between successive events (the 600 ms face
     SOA here), so two events — even with identical codes — are separated by a
     return to 0 and each gets its own edge.
@@ -28,8 +28,12 @@ import threading
 from importlib import import_module
 
 _STREAM_NAME   = 'experiment_markers'
-_KEEPALIVE_HZ  = 1200.0
-_NOMINAL_SRATE = 1200.0
+# Both rates match the Simulink model / LSL Receive block (600 Hz). The
+# keepalive must not push faster than the inlet consumes (one sample per
+# model step), or samples may queue up and delay the recorded markers.
+_KEEPALIVE_HZ  = 600.0
+_NOMINAL_SRATE = 600.0
+_END_CODE      = 255     # the Simulink model stops recording on this code
 _HOLD_DURATION = 0.100   # 0 < consumer_period << hold << min_event_gap
 
 
@@ -139,7 +143,7 @@ class LSLTrigger:
             return None
         return bool(wait(float(timeout)))
 
-    def finish(self, final_code=99, margin=0.050):
+    def finish(self, final_code=_END_CODE, margin=0.050):
         """Latch a final marker, return to zero, and stop exactly once."""
         margin = float(margin)
         if margin < 0:

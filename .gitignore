@@ -2,6 +2,7 @@ data/*
 !data/.gitkeep
 stimuli/.DS_Store
 .DS_Store
+.venv/
 __pycache__/
 *.pyc
 .vscode/settings.json

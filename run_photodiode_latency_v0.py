@@ -4,14 +4,25 @@
 #
 # One condition only: full-white square in the bottom-right corner (same place
 # as the real task's photodiode square), LSL marker pushed on the onset flip via
-# win.callOnFlip, repeated N times. Offline:
+# win.callOnFlip, repeated N times.
+#
+# DURATION CODING: every flash has its own duration. Flash i keeps the square
+# on for ON_START + (i-1)*ON_STEP (rounded to whole frames), and its marker is
+# held for the same time. In the recording, the WIDTH of a photodiode pulse
+# therefore tells which flash it is, so each marker can be paired with its own
+# photodiode pulse even if the two channels are offset or stretched in time.
+# Offline:
 #     delay_i  = t_photodiode_onset_i - t_marker_onset_i   (both from the .mat)
 #     latency  = mean(delay)      jitter = SD(delay)
 #
 # Design choices (from the October 2026 repo audit):
-#   * Marker codes stay < 99 so the vMMR Simulink model (stops on >= 99) keeps
-#     recording. The only code >= 99 is END_MARKER = 255, which stops BOTH the
-#     vMMR model (>= 99) and the delay-test model (>= 255) at the end.
+#   * Rig (October 2026): 120 Hz stimulus display; Simulink on a second PC
+#     records g.HIamp + LSL markers at 600 Hz and stops when the marker
+#     reaches 255. All codes here are small except END_MARKER = 255, sent
+#     once at the end (or on abort) to stop the recording.
+#   * LSL keepalive and nominal rate default to 600 Hz to match the Simulink
+#     inlet. The keepalive must not push faster than the inlet consumes, or
+#     samples may queue up and delay the recorded markers.
 #   * A dark/light calibration segment is recorded first, so the analysis can
 #     determine the photodiode channel's polarity (it may idle HIGH) instead of
 #     assuming that 0 -> 1 means "square on".
@@ -64,8 +75,10 @@ except (ImportError, AttributeError):
 # 1. CONSTANTS
 # =============================================================================
 
-N_FLASHES_DEFAULT = 300        # ~4-5 min of flashes
-ON_DUR            = 0.250      # square visible (s), as a face in the task
+N_FLASHES_DEFAULT = 100        # ~2.5 min of flashes with the defaults below
+ON_START_MS       = 100.0      # duration of the first flash (ms)
+ON_STEP_MS        = 16.7       # each flash is this much longer than the last
+                               # (ms; rounded to whole frames, at least 1)
 OFF_MIN           = 0.350      # black gap lower bound (s); task blank = 350 ms
 OFF_MAX           = 0.650      # black gap upper bound (s); random jitter
 BASELINE_DUR      = 2.000      # black before calibration and before flashes
@@ -88,7 +101,7 @@ CAL_DARK_MARKER = 5            # onset of a calibration DARK segment
 CAL_LIGHT_MARKER = 6           # onset of the calibration LIGHT segment
 FLASH_BLOCK_MARKER = 7         # start of the flash block (not flip-aligned)
 FLASH_MARKER    = 20           # every flash onset (the latency reference)
-END_MARKER      = 255          # end/abort; stops either Simulink model
+END_MARKER      = 255          # end/abort; stops the Simulink recording
 
 QUIT_KEY = "escape"
 
@@ -201,8 +214,12 @@ def calibration_segment(win, kb, trigger, square, frame_counts):
 # 5. ONE FLASH
 # =============================================================================
 
-def run_flash(win, kb, trigger, square, on_n, off_n):
+def run_flash(win, kb, trigger, square, on_n, off_n, hold_s):
+    """One flash: square on for on_n frames, marker latched for hold_s."""
     store = {"cb": None, "lsl": None}
+    # LSLTrigger reads hold_duration when the marker is set, so this makes the
+    # marker last as long as the square.
+    trigger.hold_duration = hold_s
     dropped_before = win.nDroppedFrames
     flip_time = None
 
@@ -244,13 +261,15 @@ def main():
         "session": "001",
         "fullscreen": True,
         "screen_index": 0,
-        "expected_refresh_hz": 60,
+        "expected_refresh_hz": 120,
         "send_LSL_triggers": True,
         "n_flashes": N_FLASHES_DEFAULT,
+        "on_start_ms": ON_START_MS,
+        "on_step_ms": ON_STEP_MS,
         "square_size_px": DIODE_SIZE_DEFAULT,
         "rng_seed": 20261006,
-        "lsl_keepalive_hz": 1200,
-        "lsl_nominal_srate": 1200,
+        "lsl_keepalive_hz": 600,
+        "lsl_nominal_srate": 600,
     }
     order = list(info.keys())
     dlg = gui.DlgFromDict(info, title="Photodiode latency test", order=order)
@@ -261,16 +280,20 @@ def main():
     session     = info["session"]
     fullscreen  = bool(info["fullscreen"])
     screen_idx  = to_int(info["screen_index"], 0)
-    expected_hz = to_float(info["expected_refresh_hz"], 60.0)
+    expected_hz = to_float(info["expected_refresh_hz"], 120.0)
     send_lsl    = bool(info["send_LSL_triggers"])
     n_flashes   = to_int(info["n_flashes"], N_FLASHES_DEFAULT)
+    on_start_ms = to_float(info["on_start_ms"], ON_START_MS)
+    on_step_ms  = to_float(info["on_step_ms"], ON_STEP_MS)
     square_size = to_int(info["square_size_px"], DIODE_SIZE_DEFAULT)
     rng_seed    = to_int(info["rng_seed"], 20261006)
-    keepalive   = to_float(info["lsl_keepalive_hz"], 1200.0)
-    nominal     = to_float(info["lsl_nominal_srate"], 1200.0)
+    keepalive   = to_float(info["lsl_keepalive_hz"], 600.0)
+    nominal     = to_float(info["lsl_nominal_srate"], 600.0)
 
     if n_flashes <= 0 or square_size <= 0 or expected_hz <= 0:
         raise ValueError("n_flashes, square_size_px, expected_refresh_hz must be > 0.")
+    if on_start_ms <= 0 or on_step_ms <= 0:
+        raise ValueError("on_start_ms and on_step_ms must be > 0.")
 
     rng = random.Random(rng_seed)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -288,8 +311,9 @@ def main():
                              nominal_srate=nominal)
         if send_lsl:
             print("LSL stream 'experiment_markers' is live.", flush=True)
-            print("Start the Simulink model (check its output .mat filename "
-                  "and stop constant), then press Enter...", flush=True)
+            print("Start the Simulink model on the recording PC (check its "
+                  "output .mat filename, 600 Hz rate and stop constant 255), "
+                  "then press Enter...", flush=True)
             input()
 
         # --- window -----------------------------------------------------------
@@ -315,7 +339,8 @@ def main():
             return max(1, int(round(seconds * expected_hz)))
 
         frame_counts = {
-            "on": n_frames(ON_DUR),
+            "on_start": n_frames(on_start_ms / 1000.0),
+            "on_step": n_frames(on_step_ms / 1000.0),
             "off_min": n_frames(OFF_MIN),
             "off_max": n_frames(OFF_MAX),
             "baseline": n_frames(BASELINE_DUR),
@@ -343,7 +368,15 @@ def main():
                 f.write(f"frames[{k}]: {v}\n")
             f.write(f"square_center_px: ({x:.1f}, {y:.1f})\n")
             f.write(f"square_margin_px: {DIODE_MARGIN}\n")
-            f.write(f"on_dur_s: {ON_DUR}\noff_range_s: [{OFF_MIN}, {OFF_MAX}]\n")
+            f.write("flash i: on_frames = frames[on_start] + (i-1)*frames[on_step]; "
+                    "marker held for the same duration\n")
+            f.write(f"on_duration_first_ms: "
+                    f"{frame_counts['on_start'] / expected_hz * 1000:.2f}\n")
+            f.write(f"on_duration_step_ms: "
+                    f"{frame_counts['on_step'] / expected_hz * 1000:.2f}\n")
+            f.write(f"on_duration_last_ms: "
+                    f"{(frame_counts['on_start'] + (n_flashes - 1) * frame_counts['on_step']) / expected_hz * 1000:.2f}\n")
+            f.write(f"off_range_s: [{OFF_MIN}, {OFF_MAX}]\n")
             f.write(f"lsl_hold_duration_s: {getattr(trigger, 'hold_duration', None)}\n")
             f.write("markers: start=9 (not flip-aligned), cal_dark=5, "
                     "cal_light=6, flash_block=7 (not flip-aligned), "
@@ -357,10 +390,12 @@ def main():
         black_frames(win, kb, frame_counts["baseline"])
         calibration_segment(win, kb, trigger, square, frame_counts)
 
+        default_hold = trigger.hold_duration
         trigger.set(FLASH_BLOCK_MARKER)
         black_frames(win, kb, frame_counts["baseline"])
 
-        fields = ["flash_index", "marker_code", "on_frames", "off_frames",
+        fields = ["flash_index", "marker_code", "on_frames", "on_duration_ms",
+                  "off_frames",
                   "psychopy_flip_time", "callback_local_clock",
                   "lsl_push_timestamp", "lock_wait_ms",
                   "dropped_frames_delta", "expected_refresh_hz",
@@ -373,14 +408,18 @@ def main():
         win.recordFrameIntervals = True
         for i in range(1, n_flashes + 1):
             off_n = rng.randint(frame_counts["off_min"], frame_counts["off_max"])
-            row = run_flash(win, kb, trigger, square, frame_counts["on"], off_n)
+            on_n = frame_counts["on_start"] + (i - 1) * frame_counts["on_step"]
+            on_s = on_n / expected_hz
+            row = run_flash(win, kb, trigger, square, on_n, off_n, on_s)
             row.update({"flash_index": i, "marker_code": FLASH_MARKER,
-                        "on_frames": frame_counts["on"], "off_frames": off_n,
+                        "on_frames": on_n, "on_duration_ms": on_s * 1000.0,
+                        "off_frames": off_n,
                         "expected_refresh_hz": expected_hz,
                         "square_size_px": square_size})
             writer.writerow(row)
             csv_f.flush()
         win.recordFrameIntervals = False
+        trigger.hold_duration = default_hold      # back to the normal latch
 
         black_frames(win, kb, frame_counts["baseline"])
         text_stim.text = "Latency test complete."
@@ -393,6 +432,7 @@ def main():
         logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
     finally:
         if trigger is not None:
+            trigger.hold_duration = 0.100         # short latch for END_MARKER
             # Latch END_MARKER for hold_duration, return to 0, stop once.
             # Guarded so a stuck keepalive thread cannot skip the file saves.
             try:
