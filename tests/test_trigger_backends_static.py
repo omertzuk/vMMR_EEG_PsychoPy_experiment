@@ -1,13 +1,17 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
-MAIN_SCRIPT = ROOT / "run_vMMR_experiment_v0.py"
+MAIN_SCRIPTS = [ROOT / "run_vMMR_experiment_v0.py",
+                ROOT / "run_vMMR_experiment_v1_trig_after_framerate_measurement.py"]
 
 
-def test_parallel_backend_requires_manual_clear():
-    tree = ast.parse(MAIN_SCRIPT.read_text(encoding="utf-8"))
+@pytest.mark.parametrize("main_script", MAIN_SCRIPTS, ids=lambda p: p.stem)
+def test_parallel_backend_requires_manual_clear(main_script):
+    tree = ast.parse(main_script.read_text(encoding="utf-8"))
     eeg_trigger = next(
         node for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name == "EEGTrigger"
@@ -23,8 +27,9 @@ def test_parallel_backend_requires_manual_clear():
     assert assignments["requires_manual_clear"] is True
 
 
-def test_frame_two_clear_is_centralized_and_backend_conditional():
-    source = MAIN_SCRIPT.read_text(encoding="utf-8")
+@pytest.mark.parametrize("main_script", MAIN_SCRIPTS, ids=lambda p: p.stem)
+def test_frame_two_clear_is_centralized_and_backend_conditional(main_script):
+    source = main_script.read_text(encoding="utf-8")
     tree = ast.parse(source)
     helper = next(
         node for node in tree.body

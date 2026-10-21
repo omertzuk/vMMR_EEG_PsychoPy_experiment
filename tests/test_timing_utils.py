@@ -48,7 +48,21 @@ def test_expected_refresh_parser_accepts_supported_rates(value):
     assert parse_expected_refresh_hz(value) in (60.0, 120.0)
 
 
-@pytest.mark.parametrize("value", ["", "not-a-rate", 0, -60, 75, float("inf")])
+@pytest.mark.parametrize(("value", "expected"),
+                         [("59.94", 59.94), (59.94, 59.94), ("119.88", 119.88)])
+def test_expected_refresh_parser_accepts_fractional_video_rates(value, expected):
+    assert parse_expected_refresh_hz(value) == expected
+
+
+def test_frame_counts_at_59_94_match_60():
+    # Measured stimulus display rate: same frame counts as 60 Hz, SOA intact.
+    for duration in (0.500, 0.700, 0.600, 0.250, 0.350, 1.000, 2.000, 0.750):
+        assert seconds_to_frames(duration, 59.94) == seconds_to_frames(duration, 60)
+    assert (seconds_to_frames(0.250, 59.94) + seconds_to_frames(0.350, 59.94)
+            == seconds_to_frames(0.600, 59.94))
+
+
+@pytest.mark.parametrize("value", ["", "not-a-rate", 0, -60, 75, 59.9, float("inf")])
 def test_expected_refresh_parser_rejects_invalid_or_unsupported_rates(value):
     with pytest.raises(ValueError):
         parse_expected_refresh_hz(value)

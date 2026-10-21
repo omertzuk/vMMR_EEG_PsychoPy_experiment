@@ -270,6 +270,35 @@ Future photodiode code should preserve this policy:
 The square is only a visual timing marker. PsychoPy does not control the
 g.TRIGbox directly.
 
+The photodiode cannot be used during real experiment sessions; it is for
+calibration and validation only. The calibration is done (next section).
+
+## Marker timing calibration and correction (locked 2026-10-15)
+
+Event times for EEG analysis come from LSL timestamps, not from the marker
+channel recorded by the g.HIsys LSL Receive block:
+
+```text
+onset = t_B + offset_BA − B + 62.4 ms
+B = 90th percentile of (t_A − model time) within ±10 s of the event
+```
+
+* Implementation: `analysis/marker_timing.py` (`correct_events`), shared with the
+  calibration analysis `analysis/calibration_database_analysis.py`. Never change
+  the clock mapping (percentile, window) without re-estimating the constant.
+* Needs, for every session: the `<recording>_LSLtiming.mat` written by the
+  `LSLMarkerTimestamps` block (`matlab/on_eeg_computer/`), and `lsl_resyncs: 0`
+  in the computer-B `*_run_info.txt`.
+* Locked configuration: display 59.94 Hz (Windows setting 59.94, not 60/120),
+  `expected_refresh_hz` 59.94, LSL keepalive and nominal rate 600, LSL outlet
+  created after the window and refresh measurement (v1), g.HIamp 600 Hz with
+  frame length 8, LSL Receive 600 Hz, model stop code 255. Any change requires
+  new calibration sessions.
+* Docs: `docs/supplement_marker_timing_calibration_2026-10-15.docx` (methods),
+  `docs/lab_guide_marker_timing_2026-10.docx` (how to apply, both computers),
+  `docs/todo_experiment_and_analysis_2026-10.docx` (open work on the experiment
+  script and the vMMR analysis).
+
 ## Output files
 
 Preserve the existing outputs:
@@ -335,5 +364,4 @@ When asked to implement a feature:
 6. Prefer adding diagnostics over removing them.
 7. Explain any timing-sensitive change in the final response.
 
-Create only `AGENTS.md` for this task. Do not implement photodiode integration
-unless the user explicitly requests it.
+Do not implement photodiode integration unless the user explicitly requests it.

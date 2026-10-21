@@ -8,3 +8,8 @@ __pycache__/
 .vscode/settings.json
 HIamp_record_LSL_DD_vMMR.slx.autosave
 condaenv.5i14bgvx.requirements.txt
+
+# machine-specific LSL network configuration (each computer has its own)
+lsl_api.cfg
+# Word lock files
+docs/~$*

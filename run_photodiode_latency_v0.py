@@ -2,6 +2,12 @@
 # =============================================================================
 # Minimal PsychoPy-trigger -> photodiode latency/jitter test for the vMMR rig.
 #
+# CHANGE (2026-10-13): experiment-start screen after the sensor-alignment
+# screen. SPACE there sends EXP_START_MARKER (1) on the next flip (first black
+# frame); the black baseline, calibration (5/6/5) and flash block follow from
+# that marker, so the calibration timeline is counted from it. Runs recorded
+# before this change have no marker 1. Other codes and timing are unchanged.
+#
 # One condition only: full-white square in the bottom-right corner (same place
 # as the real task's photodiode square), LSL marker pushed on the onset flip via
 # win.callOnFlip, repeated N times.
@@ -110,6 +116,8 @@ CAL_LIGHT_MARKER = 6           # onset of the calibration LIGHT segment
 FLASH_BLOCK_MARKER = 7         # start of the flash block (not flip-aligned)
 FLASH_MARKER    = 20           # every flash onset (the latency reference)
 END_MARKER      = 255          # end/abort; stops the Simulink recording
+EXP_START_MARKER = 1           # experiment start: flip after SPACE on the
+                               # experiment-start screen (calibration counts from here)
 
 QUIT_KEY = "escape"
 
@@ -179,7 +187,7 @@ def alignment_screen(win, kb, square, text_stim, preview_on_n, preview_off_n):
         "Place the optical sensor on the blinking square (bottom-right).\n\n"
         "Check that the g.TRIGbox LED turns ON with every white square\n"
         "and OFF with every black gap.\n\n"
-        "SPACE = start      ESC = abort"
+        "SPACE = continue      ESC = abort"
     )
     kb.clearEvents()
     psychopy_event.clearEvents()
@@ -195,6 +203,31 @@ def alignment_screen(win, kb, square, text_stim, preview_on_n, preview_off_n):
                        kb.getKeys(keyList=["space"], waitRelease=False,
                                   clear=True)):
                     return
+
+
+def experiment_start_screen(win, kb, trigger, text_stim, min_wait=0.5):
+    """Shown after the sensor alignment. SPACE starts the experiment:
+    EXP_START_MARKER is pushed on the next flip (a black frame), and the
+    calibration and flashes follow from it. min_wait stops the SPACE that
+    ended the alignment screen from also passing this one."""
+    text_stim.text = (
+        "Sensor aligned.\n\n"
+        "Press SPACE to start the experiment\n"
+        "(sends the experiment-start trigger).\n\n"
+        "ESC = abort"
+    )
+    kb.clearEvents()
+    psychopy_event.clearEvents()
+    wait_clock = core.Clock()
+    while True:
+        text_stim.draw()
+        win.flip()
+        check_abort(kb)
+        keys = kb.getKeys(keyList=["space"], waitRelease=False, clear=True)
+        if wait_clock.getTime() >= min_wait and any(k.name == "space" for k in keys):
+            break
+    win.callOnFlip(trigger.set, EXP_START_MARKER)
+    win.flip()                                    # black frame = marker onset
 
 
 # =============================================================================
@@ -389,7 +422,9 @@ def main():
                     f"{(frame_counts['on_start'] + (n_flashes - 1) * frame_counts['on_step']) / expected_hz * 1000:.2f}\n")
             f.write(f"off_range_s: [{OFF_MIN}, {OFF_MAX}]\n")
             f.write(f"lsl_hold_duration_s: {getattr(trigger, 'hold_duration', None)}\n")
-            f.write("markers: start=9 (not flip-aligned), cal_dark=5, "
+            f.write("markers: start=9 (not flip-aligned), "
+                    "experiment_start=1 (flip-aligned, after SPACE on the "
+                    "experiment-start screen), cal_dark=5, "
                     "cal_light=6, flash_block=7 (not flip-aligned), "
                     "flash=20 (flip-aligned latency reference), end=255\n")
 
@@ -397,6 +432,7 @@ def main():
         trigger.set(START_MARKER)
         alignment_screen(win, kb, square, text_stim,
                          frame_counts["preview_on"], frame_counts["preview_off"])
+        experiment_start_screen(win, kb, trigger, text_stim)   # marker 1
 
         black_frames(win, kb, frame_counts["baseline"])
         calibration_segment(win, kb, trigger, square, frame_counts)

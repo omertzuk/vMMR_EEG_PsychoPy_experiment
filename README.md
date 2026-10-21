@@ -644,6 +644,109 @@ Keep notes in this README or in a separate changelog:
 CHANGELOG.md
 ```
 
+### v1: LSL outlet after the refresh-rate measurement (2026-10-08)
+
+```text
+run_vMMR_experiment_v1_trig_after_framerate_measurement.py
+run_photodiode_latency_v1_trig_after_framerate_measurement.py
+```
+
+Photodiode latency runs with LSL timestamps (`notebooks/photodiode_latency_compare.ipynb`)
+showed that the first flips of the new fullscreen window (start of `getActualFrameRate`)
+pause PsychoPy for about 0.8 s. In v0 the LSL outlet already existed at that point, so
+the marker stream paused too. The Simulink model takes one LSL sample per step, so it
+stalled and never caught up (`lsl_trigger.py` resyncs after pauses > 0.1 s instead of
+sending the missed samples): all EEG data lagged the markers by about 0.8 s for the whole
+run, and every v0 `*_run_info.txt` shows `lsl_resyncs: 1`.
+
+Changes in v1:
+
+* The window is opened and the refresh rate measured **before** the LSL outlet is created.
+* The "start the Simulink model" prompt is shown on the stimulus screen instead of the
+  console (the fullscreen window covers the console). The latency test waits for SPACE;
+  the experiment waits for the Simulink inlet to connect, as before.
+* `expected_refresh_hz` defaults to `59.94`, the measured rate of the stimulus display
+  (`timing_utils.py` now also accepts 59.94 and 119.88). Frame counts are the same as at
+  60 Hz; logged durations are now exact.
+* The experiment's `*_run_info.txt` ends with `lsl_samples_sent`, `lsl_seconds`,
+  `lsl_rate_hz` and `lsl_resyncs`. `lsl_resyncs` should be `0`.
+
+Trial structure, frame timing, trigger codes and output schema are unchanged.
+
+`run_photodiode_latency_v2_trig_after_space_input.py` goes one step further for the
+latency test: the LSL outlet is created only after SPACE on the sensor-alignment screen
+(order: window → refresh measurement → alignment screen → LSL outlet → "start Simulink"
+screen → START marker 9 → baseline → calibration → flashes).
+
+From 2026-10-13 all three latency scripts (v0, v1, v2) show an **experiment-start screen**
+after the sensor-alignment screen. SPACE there sends marker **1** (experiment start) on the
+next flip; the baseline, calibration (5/6/5) and flashes follow, so the calibration
+timeline is counted from marker 1. `notebooks/photodiode_latency_compare.ipynb` ignores
+everything before marker 1 when it is present (file-name tag `expstart`).
+
+### Calibration database (`run_photodiode_latency_database.py`)
+
+The final configuration for building the marker-timing correction database: v1 start-up
+order, experiment-start marker 1, LSL 600 Hz, `expected_refresh_hz` 59.94, Simulink frame
+length 8, square and optical sensor always at the **screen centre** (where faces and primes
+appear; the sensor is not moved during the database). Dialog choices: `run_type` (`short` =
+100 flashes, `long` = 500 flashes with the width ramp repeating every 100), operator, cold
+start, notes. The run number increments per day and the
+"start Simulink" screen shows the exact EEG file names to enter in both `To File` blocks
+(`photodiode_db_<date>_<run>_slx_frame_length_8_timestamped_LSL_trig_after_framerate_expstart_sq<position>_<type>.mat`
+and `..._LSLtiming.mat`). `run_info` records software versions, the git commit and SHA-256
+hashes of the script and `lsl_trigger.py`; every run is appended to `data/database_run_log.csv`.
+Commit all changes before database runs so `git_tracked_changes: no` is recorded.
+
+The Simulink model used on the recording computer (with the `LSLMarkerTimestamps` block)
+is in `matlab/on_eeg_computer/` (`HIamp_record_LSL_DD_vMMR.slx`, `LSLMarkerTimestamps.m`;
+R2020a, liblsl-Matlab required). The protocol for the two database days is in
+`docs/calibration_database_plan_2026-10.docx`.
+
+In the end the database (14–15 October 2026) was recorded with
+`run_photodiode_latency_v1_trig_after_framerate_measurement.py` (centre square since commit
+`0cc537d`; `on_cycle` 100 for long runs), not with the database script; see below.
+
+## Marker timing correction (calibrated 2026-10-15)
+
+Every event time used in EEG analysis must be corrected:
+
+```text
+event onset (EEG model time) = t_B + offset_BA − B + 62.4 ms
+```
+
+`t_B` is the LSL send timestamp (computer B), `offset_BA` LSL's clock offset, and `B` the
+90th percentile of `t_A − model time` within ±10 s of the event (computer A's LSL clock
+against the amplifier sample clock). All three come from the `LSLMarkerTimestamps` block,
+saved by the recording model as `<recording>_LSLtiming.mat`. **Do not use the marker channel
+of `EEG_data` (g.HIsys LSL Receive) for event timing**: it varies by ~9 ms between sessions.
+
+* Correction: **62.4 ms** (95 % CI 61.7–63.0; between-session SD 1.4 ms; a new session is
+  expected within 59.4–65.3 ms). Per event: SD 5.7 ms, all within one display frame.
+  Valid for stimuli at the screen centre (bottom-right corner: +2.0 ms).
+* Code: `analysis/marker_timing.py`
+
+  ```python
+  import sys; sys.path.insert(0, "analysis")
+  from marker_timing import correct_events, to_mne_events
+  events, qc = correct_events("recording.mat", run_info="..._run_info.txt")
+  assert qc["passed"], qc["problems"]          # lsl_resyncs 0, no lasting backlog
+  mne_events = to_mne_events(events, codes=[11, 12, 21, 22, 31, 32, 41, 42])
+  ```
+
+  or `.venv/Scripts/python analysis/marker_timing.py recording.mat --run-info ..._run_info.txt`
+  (writes `recording_events_corrected.csv`). Reading the `.mat` files needs `h5py`.
+* Calibration analysis: `analysis/calibration_database_analysis.py` (reproduces every number
+  and figure of the supplement from `data/EEG/final database/`: `EEG_Computer_A/`,
+  `Computer_B/`, `run_manifest.csv`; outputs in `data/analysis/calibration_database/`).
+* Methods: `docs/supplement_marker_timing_calibration_2026-10-15.docx`; lab guide (settings and
+  scripts on both computers): `docs/lab_guide_marker_timing_2026-10.docx`; open work:
+  `docs/todo_experiment_and_analysis_2026-10.docx`.
+* The constant is tied to the locked configuration (display 59.94 Hz, LSL 600 Hz, g.HIamp
+  600 Hz frame length 8, v1 sender, model in `matlab/on_eeg_computer/`). After any change to
+  hardware, drivers, display settings, PsychoPy, `lsl_trigger.py` or the model, record at
+  least 3 calibration sessions and compare them with the database.
+
 ## Minimal pre-data-collection checklist
 
 Before collecting real EEG data:

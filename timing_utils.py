@@ -3,7 +3,9 @@
 import math
 
 
-SUPPORTED_REFRESH_RATES = (60.0, 120.0)
+# 59.94 / 119.88 are the real "60 Hz" / "120 Hz" video timings (60000/1001 Hz);
+# the vMMR stimulus display measures 59.94 Hz (photodiode latency runs, 2026-10-08).
+SUPPORTED_REFRESH_RATES = (60.0, 120.0, 59.94, 119.88)
 REFRESH_RATE_RELATIVE_TOLERANCE = 0.02
 
 
@@ -19,13 +21,13 @@ def parse_expected_refresh_hz(value):
         refresh_hz = float(str(value).strip())
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            "expected_refresh_hz must be either 60 or 120."
+            "expected_refresh_hz must be 60, 120, 59.94 or 119.88."
         ) from exc
 
     if not math.isfinite(refresh_hz) or refresh_hz <= 0:
         raise ValueError("expected_refresh_hz must be a positive finite value.")
     if refresh_hz not in SUPPORTED_REFRESH_RATES:
-        supported = " or ".join(str(int(rate)) for rate in SUPPORTED_REFRESH_RATES)
+        supported = " or ".join(f"{rate:g}" for rate in SUPPORTED_REFRESH_RATES)
         raise ValueError(f"expected_refresh_hz must be {supported}; got {value!r}.")
     return refresh_hz
 
