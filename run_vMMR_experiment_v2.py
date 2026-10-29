@@ -1,0 +1,1411 @@
+# run_vMMR_experiment_v2.py
+# =============================================================================
+# PsychoPy Coder implementation of the Dor-Ziderman et al. (2019) vMMR EEG task.
+#
+# Paradigm (Experiment 1): a 2 x 2 design, PRIME (DEATH / NEGATIVE) x IDENTITY
+# (SELF / OTHER). Each trial = a Hebrew prime word, then a sequence of 3-6
+# identical "standard" faces followed by one "deviant" (50% morph) face.
+# On 90/360 trials one face is replaced by a "target" (sunglasses) version;
+# the participant presses SPACE whenever a target is detected.
+#
+# This script reads the pre-generated trial tables in conditions/ and presents
+# the experiment with frame-based timing and optional parallel-port EEG triggers.
+#
+# OUTPUT (two files, written to data/):
+#   *_events.csv  -> one row per FACE EVENT  (used to epoch the EEG)
+#   *_trials.csv  -> one row per TRIAL       (used for behavioural QC)
+#   *_frame_intervals.csv, *_run_info.txt, *.log -> diagnostics
+#
+# CHANGES vs v1 (2026-10-29):
+#   1. End marker is END_TRIGGER = 255 (was 99), sent on normal completion and
+#      on abort; it stops the Simulink recording. PHOTODIODE_TEST_TRIGGER
+#      stays 99.
+#   2. Dialog default "photodiode_square" is False.
+#   3. Trial tables, image preloading and the text / fixation / photodiode
+#      stimuli are created BEFORE the LSL outlet. Loading images with the
+#      outlet live can pause the process and stall the Simulink model
+#      (lsl_resyncs > 0).
+#   4. Events file: new column "lslTimestamp" (LSL push time of the face
+#      marker) right after "onsetTime".
+#   Trial structure, frame timing and the other trigger codes are unchanged.
+#
+# CHANGES vs run_vMMR_experiment_v0.py (2026-10-08):
+#   * LSL mode: the window is opened and the refresh rate measured BEFORE the
+#     LSL outlet is created; the "start Simulink" messages are shown on the
+#     PsychoPy screen. The first flips of the new fullscreen window paused the
+#     process for ~0.8 s. With the outlet already live, the Simulink model
+#     (one LSL sample per step) stalled with it and never caught up, so all
+#     EEG data lagged the markers by ~0.8 s (photodiode latency runs,
+#     notebooks/photodiode_latency_compare.ipynb).
+#   * expected_refresh_hz defaults to 59.94, the measured rate of the stimulus
+#     display (frame counts are identical to 60; logged durations now exact).
+#   * run_info gets the LSL sample statistics at the end (lsl_samples_sent,
+#     lsl_rate_hz, lsl_resyncs). lsl_resyncs should be 0.
+#   Trial structure, frame timing, trigger codes and output schema unchanged.
+# =============================================================================
+
+from psychopy import visual, core, gui, logging
+from psychopy import event as psychopy_event
+from psychopy.hardware import keyboard
+
+try:
+    import psychtoolbox  # noqa: F401
+    HAS_PSYCHTOOLBOX = True
+except Exception:
+    HAS_PSYCHTOOLBOX = False
+
+# psychopy.parallel may be unavailable on machines with no parallel port
+# (e.g. when developing on a laptop). Import defensively so dry runs still work.
+try:
+    from psychopy import parallel
+except Exception:
+    parallel = None
+
+from pathlib import Path
+from datetime import datetime
+import traceback
+import csv
+import random
+import unicodedata
+
+from lsl_trigger import LSLTrigger
+from timing_utils import (
+    parse_expected_refresh_hz,
+    refresh_rate_diagnostics,
+    seconds_to_frames,
+)
+
+# =============================================================================
+# 1. CONSTANTS  -- all timings come straight from the paper's Methods section
+# =============================================================================
+
+# --- Stimulus timing (seconds). Converted to whole frames at run time. --------
+FIX_MIN          = 0.500   # trial-start fixation cross, jittered lower bound
+FIX_MAX          = 0.700   # trial-start fixation cross, jittered upper bound
+PRIME_DUR        = 0.600   # prime word shown alone
+PRE_FACE_FIX_DUR = 0.250   # prime word + central cross, just before the faces
+FACE_ON_DUR      = 0.250   # each face visible
+FACE_BLANK_DUR   = 0.350   # blank after each face  -> SOA = 250 + 350 = 600 ms
+POST_SEQUENCE_DUR = 0.500  # extra blank after the last face, see RESPONSE MODEL
+
+# --- Response model -----------------------------------------------------------
+# Responses are scored at the TRIAL level (matching the paper). A keypress
+# counts as a hit if it lands within RESPONSE_WINDOW after the target's onset.
+# POST_SEQUENCE_DUR exists so that a late hit to a target in the LAST sequence
+# position is still captured: target-on-deviant gives 600 ms inside the event
+# plus 500 ms after = 1100 ms >= RESPONSE_WINDOW.
+RESPONSE_WINDOW  = 1.000   # seconds after target onset that still counts as a hit
+RESPONSE_KEYS    = ["space"]
+QUIT_KEY         = "escape"
+
+# --- Layout (pixels; window units are 'pix') ---------------------------------
+FACE_SIZE   = (425, 405)   # matches the paper's face images
+PRIME_Y     = 260          # prime word sits above the face
+TEXT_HEIGHT = 34
+FIX_HEIGHT  = 42
+# TEXT_FONT   = "Arial"      # must contain Hebrew glyphs incl. niqqud (Arial does on Windows)
+TEXT_FONT = "Tahoma"
+# TEXT_FONT = "Narkisim"
+# TEXT_FONT = "Miriam"
+# TEXT_FONT = "Segoe UI"
+# TEXT_FONT = "Noto Sans Hebrew"
+
+# --- Photodiode timing marker -----------------------------------------------
+# The square is only a visible luminance event on the monitor. The external
+# GTEC-0270 optical sensor and GTEC-0274W g.TRIGbox convert this light change
+# into a TTL trigger for g.HIamp; PsychoPy does not control that hardware.
+DIODE_SIZE      = 45
+DIODE_MARGIN    = 40
+DIODE_CORNER    = "bottom_right"
+DIODE_COLOR_ON  = "white"
+
+PHOTODIODE_TEST_FLASHES = 100
+PHOTODIODE_TEST_TRIGGER = 99
+PHOTODIODE_TEST_INITIAL_BLACK_DUR = 1.000
+PHOTODIODE_HARDWARE_CHAIN = (
+    "GTEC-0270 optical sensor -> GTEC-0274W g.TRIGbox -> "
+    "GTEC-0274TR adapter -> g.HIamp DIGITAL IN"
+)
+
+# --- LSL/Simulink buffering diagnostic --------------------------------------
+# This is separate from the real vMMR task. It flashes a large photodiode
+# square and sends unique LSL markers on the same flip, then exits.
+LSL_BUFFER_TEST_FLASHES = 100
+LSL_BUFFER_TEST_MARKER_BASE = 100
+LSL_BUFFER_TEST_ON_DUR = 0.250
+LSL_BUFFER_TEST_OFF_DUR = 0.750
+LSL_BUFFER_TEST_INITIAL_BLACK_DUR = 2.000
+LSL_BUFFER_TEST_DIODE_SIZE = 30
+LSL_BUFFER_TEST_DIODE_MARGIN = 80
+LSL_BUFFER_TEST_DIODE_CORNER = "bottom_right"
+
+# =============================================================================
+# 2. EEG TRIGGER CODES
+# =============================================================================
+# One code per (PRIME, IDENTITY, ROLE). ROLE is the face's job in the sequence:
+#   STD/DEV          -> ordinary standard / deviant face
+#   TARGET_STD/_DEV  -> a target (sunglasses) face placed at a standard / deviant slot
+# Additional system triggers:
+#   9: Experiment start (sent after window opens and stimuli are loaded)
+#   255: experiment end or abort; stops the Simulink recording
+TRIGGER_MAP = {
+    ("DEATH",    "SELF",  "STD"):        11,
+    ("DEATH",    "SELF",  "DEV"):        12,
+    ("DEATH",    "SELF",  "TARGET_STD"): 13,
+    ("DEATH",    "SELF",  "TARGET_DEV"): 14,
+
+    ("DEATH",    "OTHER", "STD"):        21,
+    ("DEATH",    "OTHER", "DEV"):        22,
+    ("DEATH",    "OTHER", "TARGET_STD"): 23,
+    ("DEATH",    "OTHER", "TARGET_DEV"): 24,
+
+    ("NEGATIVE", "SELF",  "STD"):        31,
+    ("NEGATIVE", "SELF",  "DEV"):        32,
+    ("NEGATIVE", "SELF",  "TARGET_STD"): 33,
+    ("NEGATIVE", "SELF",  "TARGET_DEV"): 34,
+
+    ("NEGATIVE", "OTHER", "STD"):        41,
+    ("NEGATIVE", "OTHER", "DEV"):        42,
+    ("NEGATIVE", "OTHER", "TARGET_STD"): 43,
+    ("NEGATIVE", "OTHER", "TARGET_DEV"): 44,
+}
+
+END_TRIGGER = 255
+
+
+# =============================================================================
+# 3. SMALL PARSING HELPERS
+# =============================================================================
+
+def to_int(value, default=0):
+    """Parse a CSV cell to int. Empty / blank / NaN cells fall back to `default`
+    instead of crashing -- this is the fix for the targetPosition crash."""
+    s = str(value).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return default
+    return int(float(s))
+
+
+def to_float(value, default=0.0):
+    """Parse a dialog/CSV value to float, accepting blank cells as a default."""
+    s = str(value).strip()
+    if s == "" or s.lower() in ("nan", "none"):
+        return default
+    return float(s)
+
+
+def normalize_prime(value):
+    """Map the CSV primeType to a canonical 'DEATH' / 'NEGATIVE'."""
+    v = str(value).strip().upper()
+    if v.startswith("DEATH"):
+        return "DEATH"
+    if v.startswith("NEG"):
+        return "NEGATIVE"
+    raise ValueError(f"Unknown primeType: {value!r}")
+
+
+def normalize_identity(value):
+    """Map the CSV identity to a canonical 'SELF' / 'OTHER'."""
+    v = str(value).strip().upper()
+    if v.startswith("SELF"):
+        return "SELF"
+    if v.startswith("OTHER"):
+        return "OTHER"
+    raise ValueError(f"Unknown identity: {value!r}")
+
+
+def resolve_path(root, path_string):
+    """Return an absolute Path. Absolute strings (your CSV uses full Windows
+    paths) are used as-is; relative strings are resolved against the project
+    root, so the script keeps working if you switch to relative paths later."""
+    p = Path(str(path_string))
+    return p if p.is_absolute() else (root / p)
+
+def clean_hebrew_for_display(value):
+    """
+    Clean Hebrew words before sending them to PsychoPy's text renderer.
+
+    Keeps the original CSV word unchanged in the output files, but removes
+    characters that can break rendering or appear as boxes.
+    """
+    s = str(value).strip()
+
+    # Remove invisible direction/control characters sometimes present in Hebrew CSVs
+    control_chars = [
+        "\ufeff",  # BOM
+        "\u200e",  # left-to-right mark
+        "\u200f",  # right-to-left mark
+        "\u202a",  # left-to-right embedding
+        "\u202b",  # right-to-left embedding
+        "\u202c",  # pop directional formatting
+        "\u202d",  # left-to-right override
+        "\u202e",  # right-to-left override
+    ]
+    for ch in control_chars:
+        s = s.replace(ch, "")
+
+    # Remove Hebrew niqqud / combining marks.
+    # This is safest for experimental display unless you explicitly need niqqud.
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+
+    return s.strip()
+
+def sort_block_value(x):
+    """Sort key for block labels: numeric where possible, else alphabetical."""
+    try:
+        return (0, int(x))
+    except (ValueError, TypeError):
+        return (1, str(x))
+
+
+
+# =============================================================================
+# 4. TRIAL-TABLE READER
+# =============================================================================
+
+def read_trials(path):
+    """Read a conditions CSV into a list of dict rows, validating the schema."""
+    if not path.exists():
+        raise FileNotFoundError(f"Could not find trial file: {path}")
+
+    # utf-8-sig strips a BOM if Excel added one; the Hebrew words need utf-8.
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        raise ValueError(f"{path.name} contains no data rows.")
+
+    # These columns must exist for the script to build sequences and triggers.
+    required = [
+        "primeType", "identity", "word", "nStandards", "isTarget",
+        "targetPosition", "standardImage", "deviantImage",
+        "standardTargetImage", "deviantTargetImage",
+    ]
+    missing = [c for c in required if c not in rows[0]]
+    if missing:
+        raise ValueError(f"{path.name} is missing required columns: {missing}")
+
+    # 'block' and 'condCode' are optional: synthesize them if absent.
+    for r in rows:
+        if not r.get("block"):
+            r["block"] = "practice"
+        if not r.get("condCode"):
+            r["condCode"] = normalize_prime(r["primeType"])[0] + \
+                            normalize_identity(r["identity"])[0]
+    return rows
+
+
+# =============================================================================
+# 5. BUILD THE PER-TRIAL FACE SEQUENCE
+# =============================================================================
+
+def build_face_sequence(trial_row):
+    """Turn one trial row into an ordered list of face events:
+    nStandards 'STD' events, then one 'DEV' event. On target trials, the face
+    at targetPosition is swapped for its target (sunglasses) version and its
+    role becomes TARGET_STD / TARGET_DEV. Returns a list of {role, image} dicts.
+    """
+    n_standards     = to_int(trial_row["nStandards"])
+    is_target       = to_int(trial_row["isTarget"])
+    target_position = to_int(trial_row["targetPosition"])  # -1 on non-target trials
+
+    # Standards first, deviant last.
+    sequence = [{"role": "STD", "image": trial_row["standardImage"]}
+                for _ in range(n_standards)]
+    sequence.append({"role": "DEV", "image": trial_row["deviantImage"]})
+
+    # Insert the target only on target trials (so targetPosition == -1 is ignored).
+    if is_target == 1:
+        if not (1 <= target_position <= len(sequence)):
+            raise ValueError(
+                f"targetPosition {target_position} is out of range for a "
+                f"sequence of length {len(sequence)}.")
+        idx = target_position - 1            # CSV is 1-based, list is 0-based
+        if sequence[idx]["role"] == "STD":
+            sequence[idx] = {"role": "TARGET_STD",
+                             "image": trial_row["standardTargetImage"]}
+        else:  # the target landed on the deviant slot
+            sequence[idx] = {"role": "TARGET_DEV",
+                             "image": trial_row["deviantTargetImage"]}
+    return sequence
+
+
+# =============================================================================
+# 6. EEG TRIGGER HARDWARE WRAPPER
+# =============================================================================
+
+class EEGTrigger:
+    """Thin wrapper around the parallel port. When disabled, every call is a
+    no-op, so the exact same code runs during a no-hardware dry run."""
+
+    requires_manual_clear = True
+
+    def __init__(self, enabled=False, address="0x0378"):
+        self.enabled = enabled
+        self.port = None
+        # A disabled parallel-port backend is a no-op and does not need a
+        # frame-2 callback, while the active backend must return its lines low.
+        self.requires_manual_clear = bool(enabled)
+        if not self.enabled:
+            return
+        if parallel is None:
+            raise RuntimeError("EEG triggers requested but psychopy.parallel "
+                               "is unavailable on this machine.")
+        addr = str(address).strip()
+        addr_int = int(addr, 16) if addr.lower().startswith("0x") else int(addr)
+        self.port = parallel.ParallelPort(address=addr_int)
+        self.port.setData(0)                 # ensure all lines start low
+
+    def set(self, code):
+        if self.port is not None:
+            self.port.setData(int(code))
+
+    def clear(self):
+        if self.port is not None:
+            self.port.setData(0)
+
+
+# =============================================================================
+# 7. PRE-LOAD ALL IMAGES (created once -> reused -> reliable timing)
+# =============================================================================
+
+def preload_images(win, root, trial_rows):
+    """Create one ImageStim per unique image file. The dict is keyed by the raw
+    CSV path string, which is exactly what build_face_sequence stores."""
+    image_columns = ["standardImage", "deviantImage",
+                     "standardTargetImage", "deviantTargetImage"]
+    paths = sorted({row[col] for row in trial_rows for col in image_columns
+                    if str(row.get(col, "")).strip() != ""})
+
+    stims = {}
+    for raw in paths:
+        full = resolve_path(root, raw)
+        if not full.exists():
+            raise FileNotFoundError(f"Image not found: {full}")
+        stims[raw] = visual.ImageStim(win, image=str(full), pos=(0, 0),
+                                      size=FACE_SIZE, units="pix",
+                                      interpolate=True)
+    return stims
+
+
+# =============================================================================
+# 8. OUTPUT WRITERS  -- two separate files (events vs trials)
+# =============================================================================
+
+def make_event_writer(path):
+    """Per-FACE-EVENT file: stimulus identity + EEG trigger. This is the file
+    you align to the EEG. No response columns -- responses are trial-level."""
+    fields = ["participant", "session", "phase", "block",
+              "trial_global", "trial_in_block",
+              "primeType", "identity", "condCode", "word", "nStandards",
+              "isTargetTrial", "targetPosition",
+              "eventIndex", "eventRole", "eventImage",
+              "isAnalysisStandard", "isAnalysisDeviant",
+              "triggerCode", "onsetTime", "lslTimestamp"]
+    f = open(path, "w", encoding="utf-8", newline="")
+    w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+    w.writeheader()
+    f.flush()
+    return w, f
+
+
+def make_trial_writer(path):
+    """Per-TRIAL file: one behavioural outcome per trial. This is the file you
+    use for the hit-rate QC."""
+    fields = ["participant", "session", "phase", "block",
+              "trial_global", "trial_in_block",
+              "primeType", "identity", "condCode", "word", "nStandards",
+              "isTargetTrial", "targetPosition", "targetOnset",
+              "responseType", "rt", "nPresses", "correct"]
+    f = open(path, "w", encoding="utf-8", newline="")
+    w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+    w.writeheader()
+    f.flush()
+    return w, f
+
+
+def write_frame_intervals(win, path):
+    """Dump recorded frame intervals so you can verify timing afterwards."""
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["frame_index", "interval_seconds"])
+        for i, interval in enumerate(win.frameIntervals):
+            w.writerow([i, interval])
+
+
+# =============================================================================
+# 9. KEYPRESS COLLECTION  -- continuous, trial-level
+# =============================================================================
+def check_escape():
+    """
+    Robust emergency escape check.
+
+    Uses psychopy.event as a fallback because keyboard.Keyboard can sometimes
+    miss ESC depending on focus/backend on Windows.
+    """
+    if psychopy_event.getKeys(keyList=[QUIT_KEY]):
+        raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+    
+def collect_presses(kb, presses):
+    """
+    Drain the keyboard buffer once. Each response key is appended to `presses`
+    as (name, rt), where rt is on the keyboard clock that was reset at the start
+    of the current trial. ESC raises to abort the experiment.
+    """
+    check_escape()
+
+    if not HAS_PSYCHTOOLBOX:
+        # PsychoPy falls back to the older event module when psychtoolbox is not
+        # installed. In that mode, polling keyboard.Keyboard first can consume
+        # events before event.getKeys sees them on some macOS setups.
+        for name, rt in psychopy_event.getKeys(
+                keyList=RESPONSE_KEYS + [QUIT_KEY], timeStamped=kb.clock):
+            if name == QUIT_KEY:
+                raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+            if name in RESPONSE_KEYS:
+                presses.append((name, rt))
+        return
+
+    keys = kb.getKeys(
+        keyList=RESPONSE_KEYS + [QUIT_KEY],
+        waitRelease=False,
+        clear=True
+    )
+    if not keys:
+        # Fallback for systems where psychopy.hardware.keyboard does not receive
+        # key events from the PsychoPy window, seen on some laptop/macOS setups.
+        for name, rt in psychopy_event.getKeys(
+                keyList=RESPONSE_KEYS + [QUIT_KEY], timeStamped=kb.clock):
+            if name == QUIT_KEY:
+                raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+            if name in RESPONSE_KEYS:
+                presses.append((name, rt))
+        return
+
+    for k in keys:
+        if k.name == QUIT_KEY:
+            raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+        if k.name in RESPONSE_KEYS:
+            presses.append((k.name, k.rt))
+
+# =============================================================================
+# 10. DISPLAY HELPERS
+# =============================================================================
+
+def make_diode_stim(win, size=100, margin=40, corner="bottom_right"):
+    """Return a photodiode square positioned in the requested screen corner."""
+    corner = str(corner).strip().lower()
+    if corner not in ("bottom_right", "top_right", "bottom_left", "top_left"):
+        raise ValueError(f"Unsupported photodiode corner: {corner!r}")
+
+    if corner.endswith("right"):
+        x = win.size[0] / 2 - margin - size / 2
+    else:
+        x = -win.size[0] / 2 + margin + size / 2
+
+    if corner.startswith("top"):
+        y = win.size[1] / 2 - margin - size / 2
+    else:
+        y = -win.size[1] / 2 + margin + size / 2
+
+    return visual.Rect(win, width=size, height=size, pos=(x, y),
+                       fillColor=DIODE_COLOR_ON, lineColor=DIODE_COLOR_ON,
+                       units="pix")
+
+
+def show_text_and_wait(win, kb, text_stim, message,
+                        allowed_keys=("space",), min_wait=0.20):
+    """Show a static message until an allowed key is pressed."""
+    text_stim.text = message
+    kb.clearEvents()
+    psychopy_event.clearEvents()
+    wait_clock = core.Clock()
+
+    while True:
+        text_stim.draw()
+        win.flip()
+
+        check_escape()
+
+        if HAS_PSYCHTOOLBOX:
+            keys = kb.getKeys(
+                keyList=list(allowed_keys) + [QUIT_KEY],
+                waitRelease=False,
+                clear=True
+            )
+            key_names = [k.name for k in keys]
+            if not key_names:
+                key_names = psychopy_event.getKeys(
+                    keyList=list(allowed_keys) + [QUIT_KEY])
+        else:
+            key_names = psychopy_event.getKeys(
+                keyList=list(allowed_keys) + [QUIT_KEY])
+
+        if QUIT_KEY in key_names:
+            raise KeyboardInterrupt("Experiment aborted with ESCAPE.")
+
+        if wait_clock.getTime() >= min_wait:
+            for name in key_names:
+                if name in allowed_keys:
+                    return
+
+
+def present_static(win, kb, draw_list, n_frames, presses):
+    """Draw a fixed set of stimuli for n_frames, collecting keypresses every
+    frame. Covers the fixation, prime, pre-face-fix and post-sequence periods."""
+    for _ in range(n_frames):
+        for stim in draw_list:
+            stim.draw()
+        win.flip()
+        collect_presses(kb, presses)
+
+
+def _send_marker_and_store_lsl_timestamp(trigger, onset, code):
+    """Push a marker after flip timestamps have already been recorded."""
+    if hasattr(trigger, "set_with_timestamp"):
+        onset["lsl"] = trigger.set_with_timestamp(code)
+    else:
+        trigger.set(code)
+        onset["lsl"] = None
+
+
+def _schedule_manual_clear_if_required(win, trigger, frame_n):
+    """Return pulse-style hardware to zero without shortening LSL latches."""
+    if frame_n == 1 and getattr(trigger, "requires_manual_clear", False):
+        win.callOnFlip(trigger.clear)
+
+
+# =============================================================================
+# 11. PRESENT ONE FACE EVENT
+# =============================================================================
+
+def present_face_event(win, kb, prime_stim, image_stim, diode_stim,
+                        role, trigger_code, trigger,
+                        face_on_frames, blank_frames, presses):
+    """Present one face: prime + face for 250 ms, then prime alone for 350 ms.
+    The trigger is sent on the face-onset flip. Pulse-style hardware is cleared
+    one frame later; the LSL backend remains latched for its hold duration.
+    Keypresses are collected throughout (continuous response model).
+
+    Returns (onset_global, onset_trialclock, onset_lsl):
+      onset_global     -- event onset on the global clock, for the events file
+      onset_trialclock -- target onset on the trial clock, or None if not a target
+      onset_lsl        -- LSL push timestamp of the marker, or None without LSL
+    """
+    is_target_event = role.startswith("TARGET")
+    onset = {"global": None, "trial": None, "lsl": None}
+
+    # ----- face ON (prime + face) --------------------------------------------
+    # If enabled, the photodiode square appears on the exact same flip as the
+    # face. The ordinary PsychoPy trigger remains the condition label; the
+    # optical channel should be used later to align EEG to true visual onset.
+    for frame_n in range(face_on_frames):
+        prime_stim.draw()
+        image_stim.draw()
+        if diode_stim is not None:
+            diode_stim.draw()              # photodiode square only while face is on
+        if frame_n == 0:                   # first frame: arm onset actions
+            # Queue timing capture before the LSL push so saved onset values do
+            # not include time waiting for the outlet lock or network call.
+            win.timeOnFlip(onset, "global")
+            if is_target_event:
+                win.callOnFlip(
+                    lambda: onset.__setitem__("trial", kb.clock.getTime())
+                )
+            win.callOnFlip(
+                _send_marker_and_store_lsl_timestamp,
+                trigger, onset, trigger_code,
+            )
+        _schedule_manual_clear_if_required(win, trigger, frame_n)
+        win.flip()
+        collect_presses(kb, presses)
+
+    # ----- face OFF (prime alone) --------------------------------------------
+    for _ in range(blank_frames):
+        prime_stim.draw()
+        win.flip()
+        collect_presses(kb, presses)
+
+    return onset["global"], onset["trial"], onset["lsl"]
+
+
+def run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base_path):
+    """Flash the diode square 100 times, then return before the experiment.
+
+    The g.TRIGbox is external hardware: this routine only creates the visible
+    luminance events that the GTEC-0270 sensor detects. The optional software
+    marker is useful for measuring software-trigger-to-optical-trigger delay.
+    """
+    if diode_stim is None:
+        raise ValueError("Photodiode test mode requires a diode stimulus.")
+
+    out_path = Path(str(base_path) + "_photodiode_test.csv")
+    fields = [
+        "flash_index",
+        "psychopy_onset_time",
+        "onsetTime",
+        "trigger_code",
+        "triggerCode",
+        "intended_on_duration",
+        "intended_blank_duration",
+    ]
+
+    def _check_abort():
+        check_escape()
+        keys = kb.getKeys(keyList=[QUIT_KEY], waitRelease=False, clear=True)
+        for k in keys:
+            if k.name == QUIT_KEY:
+                raise KeyboardInterrupt("Photodiode test aborted with ESCAPE.")
+
+    def _black_frames(n_frames):
+        for _ in range(n_frames):
+            win.flip()
+            _check_abort()
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        kb.clearEvents()
+        psychopy_event.clearEvents()
+
+        # Start from a stable black screen so the first optical pulse is clean.
+        _black_frames(frame_counts["photodiode_initial_black"])
+
+        for flash_index in range(1, PHOTODIODE_TEST_FLASHES + 1):
+            onset = {"global": None, "lsl": None}
+
+            for frame_n in range(frame_counts["face_on"]):
+                diode_stim.draw()
+                if frame_n == 0:
+                    win.timeOnFlip(onset, "global")
+                    win.callOnFlip(
+                        _send_marker_and_store_lsl_timestamp,
+                        trigger, onset, PHOTODIODE_TEST_TRIGGER,
+                    )
+                _schedule_manual_clear_if_required(win, trigger, frame_n)
+                win.flip()
+                _check_abort()
+
+            _black_frames(frame_counts["blank"])
+
+            writer.writerow({
+                "flash_index": flash_index,
+                "psychopy_onset_time": onset["global"],
+                "onsetTime": onset["global"],
+                "trigger_code": PHOTODIODE_TEST_TRIGGER,
+                "triggerCode": PHOTODIODE_TEST_TRIGGER,
+                "intended_on_duration": FACE_ON_DUR,
+                "intended_blank_duration": FACE_BLANK_DUR,
+            })
+            f.flush()
+
+
+def run_lsl_buffer_test(win, kb, trigger, frame_counts, base_path):
+    """Flash a large diode square with unique LSL markers, then exit.
+
+    This diagnostic tests whether a long marker-to-optical delay comes from the
+    LSL/Simulink path rather than real display latency. The square and marker
+    are both scheduled on the same `win.flip()` via `win.callOnFlip(...)`.
+    """
+    diode_stim = make_diode_stim(
+        win,
+        size=DIODE_SIZE,
+        margin=DIODE_MARGIN,
+        corner=DIODE_CORNER,
+    )
+    out_path = Path(str(base_path) + "_lsl_buffer_test.csv")
+    on_frames = frame_counts["lsl_buffer_on"]
+    off_frames = frame_counts["lsl_buffer_off"]
+    initial_black_frames = frame_counts["lsl_buffer_initial_black"]
+    fields = [
+        "flash_index",
+        "marker_code",
+        "psychopy_flip_timestamp",
+        "psychopy_global_onset_time",
+        "lsl_event_timestamp",
+        "lsl_push_timestamp",
+        "expected_refresh_hz",
+        "measured_refresh_hz",
+        "intended_on_duration",
+        "intended_off_duration",
+        "intended_initial_black_duration",
+        "frame_rate",
+        "on_frames",
+        "off_frames",
+        "initial_black_frames",
+        "notes",
+    ]
+
+    def _check_abort():
+        check_escape()
+        keys = kb.getKeys(keyList=[QUIT_KEY], waitRelease=False, clear=True)
+        for k in keys:
+            if k.name == QUIT_KEY:
+                raise KeyboardInterrupt("LSL buffer test aborted with ESCAPE.")
+
+    def _black_frames(n_frames):
+        for _ in range(n_frames):
+            win.flip()
+            _check_abort()
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        kb.clearEvents()
+        psychopy_event.clearEvents()
+
+        # Stable black baseline before the first optical pulse.
+        _black_frames(initial_black_frames)
+
+        for flash_index in range(1, LSL_BUFFER_TEST_FLASHES + 1):
+            marker_code = LSL_BUFFER_TEST_MARKER_BASE + flash_index
+            onset = {"global": None, "lsl": None}
+
+            # Identical to present_face_event: capture the flip timestamp first,
+            # then push the marker. LSL auto-expires; pulse hardware clears on
+            # frame 2 only when its backend requests that behavior.
+            for frame_n in range(on_frames):
+                diode_stim.draw()
+                if frame_n == 0:
+                    win.timeOnFlip(onset, "global")
+                    win.callOnFlip(
+                        _send_marker_and_store_lsl_timestamp,
+                        trigger, onset, marker_code,
+                    )
+                _schedule_manual_clear_if_required(win, trigger, frame_n)
+                win.flip()
+                _check_abort()
+
+            _black_frames(off_frames)
+
+            writer.writerow({
+                "flash_index": flash_index,
+                "marker_code": marker_code,
+                "psychopy_flip_timestamp": onset["global"],
+                "psychopy_global_onset_time": onset["global"],
+                "lsl_event_timestamp": onset["lsl"],
+                "lsl_push_timestamp": onset["lsl"],
+                "expected_refresh_hz": frame_counts["expected_rate"],
+                "measured_refresh_hz": frame_counts["measured_rate"],
+                "intended_on_duration": LSL_BUFFER_TEST_ON_DUR,
+                "intended_off_duration": LSL_BUFFER_TEST_OFF_DUR,
+                "intended_initial_black_duration": (
+                    LSL_BUFFER_TEST_INITIAL_BLACK_DUR
+                ),
+                "frame_rate": frame_counts["rate"],
+                "on_frames": on_frames,
+                "off_frames": off_frames,
+                "initial_black_frames": initial_black_frames,
+                "notes": (
+                    "marker and square scheduled on same flip; PsychoPy and "
+                    "LSL timestamps are not directly subtracted"
+                ),
+            })
+            f.flush()
+
+
+# =============================================================================
+# 12. SCORE ONE TRIAL  -- trial-level continuous-response attribution
+# =============================================================================
+
+def attribute_responses(is_target_trial, target_onset, presses):
+    """Decide the behavioural outcome of a trial from its keypresses.
+
+    target trial : first press within [target_onset, target_onset+WINDOW] = hit;
+                   otherwise = miss. Extra presses are not penalised.
+    non-target   : any press = false_alarm; none = correct_rejection.
+    Returns (response_type, rt, n_presses, correct).
+    """
+    n_presses = len(presses)
+
+    if is_target_trial and target_onset is not None:
+        hit_rt = None
+        for _, rt in sorted(presses, key=lambda p: p[1]):       # earliest first
+            if target_onset <= rt <= target_onset + RESPONSE_WINDOW:
+                hit_rt = rt
+                break
+        if hit_rt is not None:
+            return "hit", hit_rt - target_onset, n_presses, 1
+        return "miss", None, n_presses, 0
+
+    # non-target trial
+    if n_presses > 0:
+        return "false_alarm", None, n_presses, 0
+    return "correct_rejection", None, n_presses, 1
+
+
+# =============================================================================
+# 13. RUN ONE TRIAL
+# =============================================================================
+
+def run_trial(row, phase, participant, session, trial_global,
+              win, kb, event_writer, event_f, trial_writer, trial_f,
+              image_stims, trigger, fix_stim, prime_stim,
+              frame_counts, diode_stim=None):
+    """Fixation -> prime -> pre-face cross -> face sequence -> post-sequence
+    window. Writes one events-file row per face and one trials-file row total."""
+    prime_type = normalize_prime(row["primeType"])
+    identity   = normalize_identity(row["identity"])
+    cond_code  = row["condCode"]
+    word       = row["word"]
+    is_target  = to_int(row["isTarget"])
+    n_standards     = to_int(row["nStandards"])
+    target_position = to_int(row["targetPosition"])
+    trial_in_block  = row.get("trial_in_block", "")
+
+    sequence = build_face_sequence(row)
+
+    # --- start the trial clock -----------------------------------------------
+    # Reset the keyboard clock so every keypress rt is measured from trial start;
+    # clear any stale presses left over from the previous trial.
+    kb.clearEvents()
+    psychopy_event.clearEvents()
+    kb.clock.reset()
+    presses = []                              # (name, rt) collected all trial
+
+    # Record frame intervals only during trials (keeps instruction-screen waits
+    # out of the timing log).
+    win.recordFrameIntervals = True
+
+    # Persistent prime word: set the text once; it stays visible from the prime
+    # period until the end of the trial.
+    prime_stim.text = clean_hebrew_for_display(word)
+
+    # --- 1) trial-start fixation: cross only, jittered 500-700 ms ------------
+    requested_fix_duration = random.uniform(FIX_MIN, FIX_MAX)
+    fix_frames = seconds_to_frames(
+        requested_fix_duration, frame_counts["expected_rate"]
+    )
+    present_static(win, kb, [fix_stim], fix_frames, presses)
+
+    # --- 2) prime word alone, 600 ms ----------------------------------------
+    present_static(win, kb, [prime_stim], frame_counts["prime"], presses)
+
+    # --- 3) prime word + central cross, 250 ms ------------------------------
+    present_static(win, kb, [prime_stim, fix_stim],
+                   frame_counts["pre_face"], presses)
+
+    # --- 4) the face sequence ------------------------------------------------
+    target_onset = None
+    for event_index, face_event in enumerate(sequence, start=1):
+        role        = face_event["role"]
+        image_path  = face_event["image"]
+        trig_code   = TRIGGER_MAP[(prime_type, identity, role)]
+        image_stim  = image_stims[image_path]
+
+        onset_global, onset_trial, onset_lsl = present_face_event(
+            win, kb, prime_stim, image_stim, diode_stim,
+            role, trig_code, trigger,
+            frame_counts["face_on"], frame_counts["blank"], presses)
+
+        if onset_trial is not None:           # this event was the target
+            target_onset = onset_trial
+
+        # Analysis flags. The paper uses the 3rd face as the standard comparator
+        # (this equalises standard/deviant counts) and EXCLUDES whole target
+        # trials from the ERP analysis -- hence the `is_target == 0` term.
+        is_analysis_standard = int(role == "STD" and event_index == 3
+                                   and is_target == 0)
+        is_analysis_deviant  = int(role == "DEV" and is_target == 0)
+
+        event_writer.writerow({
+            "participant": participant, "session": session, "phase": phase,
+            "block": row["block"], "trial_global": trial_global,
+            "trial_in_block": trial_in_block,
+            "primeType": prime_type, "identity": identity,
+            "condCode": cond_code, "word": word, "nStandards": n_standards,
+            "isTargetTrial": is_target, "targetPosition": target_position,
+            "eventIndex": event_index, "eventRole": role,
+            "eventImage": image_path,
+            "isAnalysisStandard": is_analysis_standard,
+            "isAnalysisDeviant": is_analysis_deviant,
+            "triggerCode": trig_code, "onsetTime": onset_global,
+            "lslTimestamp": onset_lsl,
+        })
+        event_f.flush()
+
+    # --- 5) post-sequence window: prime word stays, catches late hits --------
+    present_static(win, kb, [prime_stim], frame_counts["post_seq"], presses)
+
+    win.recordFrameIntervals = False
+
+    # --- score the trial and write the behavioural row ----------------------
+    response_type, rt, n_presses, correct = attribute_responses(
+        is_target == 1, target_onset, presses)
+
+    trial_writer.writerow({
+        "participant": participant, "session": session, "phase": phase,
+        "block": row["block"], "trial_global": trial_global,
+        "trial_in_block": trial_in_block,
+        "primeType": prime_type, "identity": identity, "condCode": cond_code,
+        "word": word, "nStandards": n_standards,
+        "isTargetTrial": is_target, "targetPosition": target_position,
+        "targetOnset": target_onset, "responseType": response_type,
+        "rt": rt, "nPresses": n_presses, "correct": correct,
+    })
+    trial_f.flush()
+
+
+# =============================================================================
+# 14. MAIN
+# =============================================================================
+
+def main():
+    root            = Path(__file__).resolve().parent
+    conditions_dir  = root / "conditions"
+    data_dir        = root / "data"
+    data_dir.mkdir(exist_ok=True)
+
+    # --- startup dialog ------------------------------------------------------
+    # Boolean values render as checkboxes in the dialog.
+    exp_info = {
+        "participant": "test001",
+        "session": "001",
+        "fullscreen": True,
+        "expected_refresh_hz": "59.94",   # measured rate of the stimulus display
+        "send_LSL_triggers": True,
+        "parallel_port_address": "0x0378",
+        "photodiode_square": False,
+        "photodiode_test_mode": False,
+        "lsl_buffer_test_mode": False,
+        "lsl_keepalive_hz": 600,
+        "lsl_nominal_srate": 600,
+    }
+    dlg = gui.DlgFromDict(exp_info, title="vMMR EEG experiment",
+                          order=["participant", "session", "fullscreen",
+                                 "expected_refresh_hz",
+                                 "send_LSL_triggers",
+                                 "parallel_port_address",
+                                 "photodiode_square",
+                                 "photodiode_test_mode",
+                                 "lsl_buffer_test_mode",
+                                 "lsl_keepalive_hz",
+                                 "lsl_nominal_srate"])
+    if not dlg.OK:
+        core.quit()
+
+    participant            = exp_info["participant"]
+    session                = exp_info["session"]
+    fullscreen             = bool(exp_info["fullscreen"])
+    try:
+        expected_refresh_hz = parse_expected_refresh_hz(
+            exp_info["expected_refresh_hz"]
+        )
+    except ValueError as exc:
+        error_dlg = gui.Dlg(title="Invalid refresh rate")
+        error_dlg.addText(str(exc))
+        error_dlg.show()
+        core.quit()
+        return
+    send_eeg_triggers      = False
+    send_lsl_triggers      = bool(exp_info["send_LSL_triggers"])
+    use_photodiode_square  = bool(exp_info["photodiode_square"])
+    photodiode_test_mode   = bool(exp_info["photodiode_test_mode"])
+    lsl_buffer_test_mode   = bool(exp_info["lsl_buffer_test_mode"])
+    lsl_keepalive_hz       = to_float(exp_info["lsl_keepalive_hz"],
+                                      default=600.0)
+    lsl_nominal_srate      = to_float(exp_info["lsl_nominal_srate"],
+                                      default=600.0)
+    if lsl_keepalive_hz <= 0:
+        raise ValueError("lsl_keepalive_hz must be positive.")
+    if lsl_nominal_srate <= 0:
+        raise ValueError("lsl_nominal_srate must be positive.")
+
+    # --- output file names ---------------------------------------------------
+    stamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base      = data_dir / f"{participant}_ses-{session}_{stamp}"
+
+    log_file = logging.LogFile(str(base) + ".log", level=logging.EXP)
+    logging.console.setLevel(logging.WARNING)
+
+    win = None
+    trigger = None
+    event_f = None
+    trial_f = None
+    lsl_consumer_check_available = None
+    lsl_consumer_connected = None
+    run_exception = None
+    try:
+        # --- window ----------------------------------------------------------
+        # v1: window and refresh-rate measurement come BEFORE the LSL outlet
+        # (see the header): the ~0.8 s pause of the first fullscreen flips must
+        # not interrupt the marker stream that paces the Simulink model.
+        win = visual.Window(size=(1200, 800), fullscr=fullscreen, units="pix",
+                             color="black", allowGUI=not fullscreen,
+                             waitBlanking=True)
+        win.mouseVisible = False
+        win.recordFrameIntervals = False      # toggled on per-trial in run_trial
+
+        kb = keyboard.Keyboard()
+
+        # --- measure the refresh rate and convert durations to frames --------
+        measured_refresh_hz = win.getActualFrameRate(
+            nIdentical=60, nMaxFrames=180, nWarmUpFrames=10, threshold=1
+        )
+        refresh_diagnostics = refresh_rate_diagnostics(
+            expected_refresh_hz, measured_refresh_hz
+        )
+        if not refresh_diagnostics["measurement_successful"]:
+            logging.warning(
+                "Could not measure monitor refresh rate; using configured "
+                f"expected_refresh_hz={expected_refresh_hz:g} for frame "
+                "conversion and dropped-frame diagnostics."
+            )
+        elif not refresh_diagnostics["matches_expected"]:
+            message = (
+                "Monitor refresh-rate mismatch. "
+                f"Expected {expected_refresh_hz:.3f} Hz but PsychoPy measured "
+                f"{measured_refresh_hz:.3f} Hz (allowed difference: 2%). "
+                "The run will stop before practice or experimental trials."
+            )
+            logging.error(message)
+            print(message, flush=True)
+            error_dlg = gui.Dlg(title="Refresh-rate mismatch")
+            error_dlg.addText(message)
+            error_dlg.show()
+            raise RuntimeError(message)
+
+        threshold_rate = refresh_diagnostics["threshold_rate_hz"]
+        win.refreshThreshold = (1.0 / threshold_rate) * 1.2
+
+        frame_duration_seconds = {
+            "fix_min": FIX_MIN,
+            "fix_max": FIX_MAX,
+            "prime": PRIME_DUR,
+            "pre_face": PRE_FACE_FIX_DUR,
+            "face_on": FACE_ON_DUR,
+            "blank": FACE_BLANK_DUR,
+            "face_soa": FACE_ON_DUR + FACE_BLANK_DUR,
+            "post_seq": POST_SEQUENCE_DUR,
+            "photodiode_initial_black": PHOTODIODE_TEST_INITIAL_BLACK_DUR,
+            "lsl_buffer_initial_black": LSL_BUFFER_TEST_INITIAL_BLACK_DUR,
+            "lsl_buffer_on": LSL_BUFFER_TEST_ON_DUR,
+            "lsl_buffer_off": LSL_BUFFER_TEST_OFF_DUR,
+        }
+
+        frame_counts = {
+            "expected_rate": expected_refresh_hz,
+            "measured_rate": measured_refresh_hz,
+            # Compatibility alias: all frame loops use the expected rate.
+            "rate": expected_refresh_hz,
+        }
+        frame_counts.update({
+            name: seconds_to_frames(seconds, expected_refresh_hz)
+            for name, seconds in frame_duration_seconds.items()
+        })
+        if (frame_counts["face_on"] + frame_counts["blank"]
+                != frame_counts["face_soa"]):
+            raise RuntimeError(
+                "Face timing invariant failed: face_on frames + blank frames "
+                "must equal the 600 ms face SOA."
+            )
+
+        # --- load trial tables, preload images and create stimuli -----------
+        # v2: done BEFORE the LSL outlet exists. Loading images with the outlet
+        # live can pause the process and stall the Simulink model
+        # (lsl_resyncs > 0).
+        practice_rows = read_trials(conditions_dir / "practice_trials.csv")
+        main_rows     = read_trials(conditions_dir / "main_trials.csv")
+        all_rows      = practice_rows + main_rows
+
+        image_stims = preload_images(win, root, all_rows)
+
+        instruction_text = visual.TextStim(win, text="", pos=(0, 0),
+                                           height=TEXT_HEIGHT, color="white",
+                                           font=TEXT_FONT, wrapWidth=1000,
+                                           units="pix")
+        # Hebrew prime word. The legacy TextStim renderer on Windows crashes on
+        # Hebrew letters that carry niqqud (base letter + combining vowel mark).
+        # TextBox2 has a proper Unicode/RTL renderer and handles this correctly.
+        # Note the API differences: letterHeight (not height), and an explicit
+        # box size + anchor/alignment to keep the word centred at PRIME_Y.
+        prime_stim = visual.TextBox2(win, text="", font=TEXT_FONT,
+                                     pos=(0, PRIME_Y), letterHeight=TEXT_HEIGHT,
+                                     color="white", units="pix",
+                                     size=(1000, 100),
+                                     alignment="center", anchor="center",
+                                     borderColor=None, fillColor=None,
+                                     languageStyle="RTL", editable=False)
+        # --- temporary Hebrew rendering test ----------------------------------------
+        # prime_stim.text = clean_hebrew_for_display("בְּרֵאשִׁית")
+        # prime_stim.draw()
+        # win.flip()
+        # core.wait(2.0)
+
+        fix_stim = visual.TextStim(win, text="+", pos=(0, 0), height=FIX_HEIGHT,
+                                   color="white", font=TEXT_FONT, units="pix")
+
+        diode_stim = None
+        if use_photodiode_square or photodiode_test_mode:
+            diode_stim = make_diode_stim(
+                win,
+                size=DIODE_SIZE,
+                margin=DIODE_MARGIN,
+                corner=DIODE_CORNER,
+            )
+
+        # --- hardware: LSL outlet AFTER the refresh measurement, then wait
+        #     for Simulink (messages on the stimulus screen, which covers the
+        #     console in fullscreen) ------------------------------------------
+        if send_lsl_triggers:
+            status_text = visual.TextStim(win, text="", pos=(0, 0),
+                                          height=TEXT_HEIGHT, color="white",
+                                          font=TEXT_FONT, wrapWidth=1000,
+                                          units="pix")
+            trigger = LSLTrigger(
+                enabled=True,
+                keepalive_hz=lsl_keepalive_hz,
+                nominal_srate=lsl_nominal_srate,
+            )
+            print("LSL marker stream 'experiment_markers' created.", flush=True)
+            print("\nOutlet live. Start the Simulink model now.", flush=True)
+            status_text.text = ("LSL stream 'experiment_markers' is live.\n\n"
+                                "Start the Simulink model now\n"
+                                "(waiting up to 15 s for it to connect).")
+            status_text.draw()
+            win.flip()
+            lsl_consumer_connected = trigger.wait_for_consumers(timeout=15.0)
+            lsl_consumer_check_available = lsl_consumer_connected is not None
+            if lsl_consumer_connected is False:
+                message = (
+                    "No Simulink LSL inlet connected to 'experiment_markers' "
+                    "within 15 seconds. The run will stop before data collection."
+                )
+                print(message, flush=True)
+                raise RuntimeError(message)
+            if lsl_consumer_connected is None:
+                logging.warning(
+                    "This pylsl version cannot detect consumers automatically; "
+                    "using the manual Simulink confirmation workflow."
+                )
+                print(
+                    "Automatic LSL consumer detection is unavailable. Start the "
+                    "Simulink model, then press SPACE on the stimulus screen.",
+                    flush=True,
+                )
+                show_text_and_wait(win, kb, status_text,
+                    "LSL stream 'experiment_markers' is live.\n\n"
+                    "Start the Simulink model on the recording PC,\n"
+                    "then press SPACE.")
+            else:
+                print("Simulink LSL inlet detected.", flush=True)
+        else:
+            trigger = EEGTrigger(enabled=send_eeg_triggers,
+                                 address=exp_info["parallel_port_address"])
+
+        # --- run-info diagnostics file --------------------------------------
+        with open(str(base) + "_run_info.txt", "w", encoding="utf-8") as f:
+            f.write(f"participant: {participant}\nsession: {session}\n")
+            f.write(f"timestamp: {stamp}\n")
+            f.write(f"script: {Path(__file__).name}\n")
+            f.write("lsl_outlet_created: after window opening and refresh-rate "
+                    "measurement (v1)\n")
+            f.write(f"expected_refresh_hz: {expected_refresh_hz}\n")
+            f.write(f"measured_refresh_hz: {measured_refresh_hz}\n")
+            f.write(
+                "refresh_measurement_successful: "
+                f"{str(refresh_diagnostics['measurement_successful']).lower()}\n"
+            )
+            f.write(
+                "refresh_rate_difference_hz: "
+                f"{refresh_diagnostics['difference_hz']}\n"
+            )
+            f.write(
+                "refresh_rate_difference_percent: "
+                f"{refresh_diagnostics['difference_percent']}\n"
+            )
+            f.write(f"dropped_frame_threshold_seconds: {win.refreshThreshold}\n")
+            for name, intended_seconds in frame_duration_seconds.items():
+                frames = frame_counts[name]
+                f.write(f"frames[{name}]: {frames}\n")
+                f.write(f"intended_duration_seconds[{name}]: {intended_seconds}\n")
+                f.write(
+                    f"realized_duration_seconds[{name}]: "
+                    f"{frames / expected_refresh_hz}\n"
+                )
+            f.write(f"send_EEG_triggers: {send_eeg_triggers}\n")
+            f.write(f"send_LSL_triggers: {send_lsl_triggers}\n")
+            f.write(f"lsl_keepalive_hz: {lsl_keepalive_hz}\n")
+            f.write(f"lsl_nominal_srate: {lsl_nominal_srate}\n")
+            f.write(f"lsl_hold_duration: {getattr(trigger, 'hold_duration', None)}\n")
+            f.write(
+                "trigger_requires_manual_clear: "
+                f"{getattr(trigger, 'requires_manual_clear', False)}\n"
+            )
+            f.write(
+                "lsl_consumer_check_available: "
+                f"{lsl_consumer_check_available}\n"
+            )
+            f.write(f"lsl_consumer_connected: {lsl_consumer_connected}\n")
+            f.write(f"parallel_port_address: {exp_info['parallel_port_address']}\n")
+            f.write(f"photodiode_square: {use_photodiode_square}\n")
+            f.write(f"photodiode_square_enabled: {use_photodiode_square}\n")
+            f.write(f"photodiode_square_size_px: {DIODE_SIZE}\n")
+            f.write(f"photodiode_square_corner: {DIODE_CORNER}\n")
+            f.write(f"photodiode_square_margin_px: {DIODE_MARGIN}\n")
+            f.write(f"photodiode_square_color_on: {DIODE_COLOR_ON}\n")
+            f.write(f"photodiode_test_mode: {photodiode_test_mode}\n")
+            f.write(f"photodiode_test_flashes: {PHOTODIODE_TEST_FLASHES}\n")
+            f.write(f"photodiode_test_trigger: {PHOTODIODE_TEST_TRIGGER}\n")
+            f.write(f"photodiode_hardware_chain: {PHOTODIODE_HARDWARE_CHAIN}\n")
+            f.write(f"lsl_buffer_test_mode: {lsl_buffer_test_mode}\n")
+            f.write(f"lsl_buffer_test_flashes: {LSL_BUFFER_TEST_FLASHES}\n")
+            f.write("lsl_buffer_test_start_trigger: 9\n")
+            f.write(
+                "lsl_buffer_test_marker_start: "
+                f"{LSL_BUFFER_TEST_MARKER_BASE + 1}\n"
+            )
+            f.write(
+                "lsl_buffer_test_marker_end: "
+                f"{LSL_BUFFER_TEST_MARKER_BASE + LSL_BUFFER_TEST_FLASHES}\n"
+            )
+            f.write(
+                "lsl_buffer_test_on_duration: "
+                f"{LSL_BUFFER_TEST_ON_DUR:.3f}\n"
+            )
+            f.write(
+                "lsl_buffer_test_off_duration: "
+                f"{LSL_BUFFER_TEST_OFF_DUR:.3f}\n"
+            )
+            f.write(
+                "lsl_buffer_test_square_size_px: "
+                f"{DIODE_SIZE}\n"
+            )
+            f.write(
+                "lsl_buffer_test_square_corner: "
+                f"{DIODE_CORNER}\n"
+            )
+            f.write(
+                "lsl_buffer_test_square_margin_px: "
+                f"{DIODE_MARGIN}\n"
+            )
+
+        if lsl_buffer_test_mode:
+            # Match the normal experiment startup marker so acquisition pipelines
+            # that gate recordings on experiment start also capture this diagnostic.
+            if trigger is not None:
+                trigger.set(9)
+            run_lsl_buffer_test(win, kb, trigger, frame_counts, base)
+            return
+
+        # --- open task writers ----------------------------------------------
+        event_writer, event_f = make_event_writer(str(base) + "_events.csv")
+        trial_writer, trial_f = make_trial_writer(str(base) + "_trials.csv")
+
+        if photodiode_test_mode:
+            run_photodiode_test(win, kb, trigger, diode_stim, frame_counts, base)
+            return
+
+        # --- send experiment start trigger -----------------------------------
+        if trigger is not None:
+            trigger.set(9)
+
+        # --- instructions ----------------------------------------------------
+        show_text_and_wait(win, kb, instruction_text,
+            "In this task you will see words and faces.\n\n"
+            "Keep your eyes on the centre of the screen.\n\n"
+            "Most faces appear normally. Occasionally a face wears sunglasses.\n"
+            "Press SPACE as fast as you can whenever you see sunglasses.\n\n"
+            "Try not to blink during the face sequences.\n\n"
+            "Press SPACE to begin the practice.")
+
+        # --- practice block --------------------------------------------------
+        trial_global = 0
+        for row in practice_rows:
+            trial_global += 1
+            run_trial(row, "practice", participant, session, trial_global,
+                      win, kb, event_writer, event_f, trial_writer, trial_f,
+                      image_stims, trigger, fix_stim, prime_stim,
+                      frame_counts, diode_stim)
+
+        show_text_and_wait(win, kb, instruction_text,
+            "Practice complete.\n\nThe main experiment will now begin.\n\n"
+            "Remember: press SPACE whenever you see sunglasses.\n\n"
+            "Press SPACE to start Block 1.")
+
+        # --- main blocks -----------------------------------------------------
+        blocks = sorted({r["block"] for r in main_rows}, key=sort_block_value)
+        for block_i, block in enumerate(blocks, start=1):
+            block_rows = [r for r in main_rows if r["block"] == block]
+
+            show_text_and_wait(win, kb, instruction_text,
+                f"Block {block_i} of {len(blocks)}\n\n"
+                "Please sit still and keep your eyes on the centre.\n"
+                "Try not to blink during the face sequences.\n\n"
+                "Press SPACE when you are ready.")
+
+            for row in block_rows:
+                trial_global += 1
+                run_trial(row, "main", participant, session, trial_global,
+                          win, kb, event_writer, event_f, trial_writer, trial_f,
+                          image_stims, trigger, fix_stim, prime_stim,
+                          frame_counts, diode_stim)
+
+            if block_i < len(blocks):         # eyes-closed rest between blocks
+                show_text_and_wait(win, kb, instruction_text,
+                    "Rest period.\n\nYou may close your eyes and rest.\n\n"
+                    "Press SPACE when you are ready to continue.")
+
+        # --- end screen ------------------------------------------------------
+        show_text_and_wait(win, kb, instruction_text,
+            "The experiment is complete.\n\nThank you.\n\n"
+            "Press SPACE to exit.")
+    except KeyboardInterrupt as e:
+        run_exception = e
+        logging.warning(f"Run ended early: {e}")
+    except Exception as e:
+        run_exception = e
+        # Log the full traceback so an unexpected crash is diagnosable.
+        logging.error(f"Unexpected error: {e}\n{traceback.format_exc()}")
+    finally:
+        if isinstance(trigger, LSLTrigger):
+            # LSL sample statistics (the stream paces the Simulink model).
+            # lsl_resyncs > 0 means a pause > 0.1 s in the stream that the model
+            # did not catch up. Read before finish() stops the keepalive;
+            # guarded so a failure here cannot skip finish() or the file saves.
+            try:
+                stats = trigger.stats()
+                run_info_path = Path(str(base) + "_run_info.txt")
+                if run_info_path.exists():
+                    with open(run_info_path, "a", encoding="utf-8") as f:
+                        f.write(f"lsl_samples_sent: {stats['samples_sent']}\n")
+                        f.write(f"lsl_seconds: {stats['seconds']}\n")
+                        f.write(f"lsl_rate_hz: {stats['rate_hz']}\n")
+                        f.write(f"lsl_resyncs: {stats['resyncs']}\n")
+            except Exception as stats_error:
+                logging.error(f"LSL statistics report problem: {stats_error}")
+        if trigger is not None:
+            try:
+                if isinstance(trigger, LSLTrigger):
+                    # finish() keeps END_TRIGGER latched for hold_duration, then
+                    # pushes zero and joins the keepalive thread exactly once.
+                    trigger.finish(final_code=END_TRIGGER)
+                else:
+                    # Preserve pulse-style parallel-port shutdown behavior.
+                    trigger.set(END_TRIGGER)
+                    if getattr(trigger, "requires_manual_clear", False):
+                        trigger.clear()
+                    if hasattr(trigger, "stop"):
+                        trigger.stop()
+            except Exception as shutdown_error:
+                logging.error(
+                    "Trigger shutdown failed after run error "
+                    f"{run_exception!r}: {shutdown_error}\n"
+                    f"{traceback.format_exc()}"
+                )
+        if win is not None:
+            write_frame_intervals(win, str(base) + "_frame_intervals.csv")
+            win.close()
+        if event_f is not None:
+            event_f.close()
+        if trial_f is not None:
+            trial_f.close()
+        logging.flush()
+        core.quit()
+
+
+if __name__ == "__main__":
+    main()
