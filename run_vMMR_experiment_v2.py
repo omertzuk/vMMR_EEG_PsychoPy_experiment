@@ -16,6 +16,11 @@
 #   *_trials.csv  -> one row per TRIAL       (used for behavioural QC)
 #   *_frame_intervals.csv, *_run_info.txt, *.log -> diagnostics
 #
+# CHANGES (2026-11-09): instruction screens match the E-Prime screens (S1-S6)
+#   from Yair Dor-Ziderman; per-block start screens removed; 1 s minimum on
+#   instruction screens; end screen exits with E (experimenter).
+#   Timing, triggers, trial logic and output files are unchanged.
+#
 # CHANGES vs v1 (2026-10-29):
 #   1. End marker is END_TRIGGER = 255 (was 99), sent on normal completion and
 #      on abort; it stops the Simulink recording. PHOTODIODE_TEST_TRIGGER
@@ -97,6 +102,10 @@ POST_SEQUENCE_DUR = 0.500  # extra blank after the last face, see RESPONSE MODEL
 RESPONSE_WINDOW  = 1.000   # seconds after target onset that still counts as a hit
 RESPONSE_KEYS    = ["space"]
 QUIT_KEY         = "escape"
+
+# --- Instruction screens --------------------------------------------------------
+INSTRUCTION_MIN_WAIT = 1.0  # s before a key can dismiss an instruction screen
+END_SCREEN_KEY       = "e"  # experimenter key that closes the end screen
 
 # --- Layout (pixels; window units are 'pix') ---------------------------------
 FACE_SIZE   = (425, 405)   # matches the paper's face images
@@ -1202,7 +1211,7 @@ def main():
             f.write(f"timestamp: {stamp}\n")
             f.write(f"script: {Path(__file__).name}\n")
             f.write("lsl_outlet_created: after window opening and refresh-rate "
-                    "measurement (v1)\n")
+                    "measurement (v2)\n")
             f.write(f"expected_refresh_hz: {expected_refresh_hz}\n")
             f.write(f"measured_refresh_hz: {measured_refresh_hz}\n")
             f.write(
@@ -1303,14 +1312,32 @@ def main():
         if trigger is not None:
             trigger.set(9)
 
-        # --- instructions ----------------------------------------------------
+        # --- instructions (E-Prime screens S1-S3) ----------------------------
         show_text_and_wait(win, kb, instruction_text,
-            "In this task you will see words and faces.\n\n"
-            "Keep your eyes on the centre of the screen.\n\n"
-            "Most faces appear normally. Occasionally a face wears sunglasses.\n"
-            "Press SPACE as fast as you can whenever you see sunglasses.\n\n"
-            "Try not to blink during the face sequences.\n\n"
-            "Press SPACE to begin the practice.")
+            "Welcome to the experiment!\n\n"
+            "On the screen, words will appear.\n"
+            "After each word, a series of faces will appear,\n"
+            "some of which will have sunglasses.\n\n"
+            "Your task is to press the SPACE key with your index finger\n"
+            "whenever a face with sunglasses appears.\n"
+            "In all other cases please refrain from pressing.\n\n"
+            "Please press with your index finger to continue",
+            min_wait=INSTRUCTION_MIN_WAIT)
+        show_text_and_wait(win, kb, instruction_text,
+            "All button presses are to be done with the index finger only.\n\n"
+            "Please try to press as fast as you can\n"
+            "but without making mistakes!!!\n\n"
+            "Please press with your index finger to continue",
+            min_wait=INSTRUCTION_MIN_WAIT)
+        show_text_and_wait(win, kb, instruction_text,
+            "The task is divided into three parts, with breaks in between.\n"
+            "Please use the break to rest.\n\n"
+            "Please try to avoid moving your head as much as possible,\n"
+            "even during the breaks.\n\n"
+            "And finally, try to blink as little as possible.\n\n"
+            "Now let's practice...\n\n"
+            "Please press with your index finger to start the practice",
+            min_wait=INSTRUCTION_MIN_WAIT)
 
         # --- practice block --------------------------------------------------
         trial_global = 0
@@ -1321,21 +1348,17 @@ def main():
                       image_stims, trigger, fix_stim, prime_stim,
                       frame_counts, diode_stim)
 
+        # --- end of practice (E-Prime S4); block 1 starts right after ---------
         show_text_and_wait(win, kb, instruction_text,
-            "Practice complete.\n\nThe main experiment will now begin.\n\n"
-            "Remember: press SPACE whenever you see sunglasses.\n\n"
-            "Press SPACE to start Block 1.")
+            "That was excellent!\n\n"
+            "Now let's begin.\n\n"
+            "When you are ready press with your index finger",
+            min_wait=INSTRUCTION_MIN_WAIT)
 
-        # --- main blocks -----------------------------------------------------
+        # --- main blocks (no per-block start screen) -------------------------
         blocks = sorted({r["block"] for r in main_rows}, key=sort_block_value)
         for block_i, block in enumerate(blocks, start=1):
             block_rows = [r for r in main_rows if r["block"] == block]
-
-            show_text_and_wait(win, kb, instruction_text,
-                f"Block {block_i} of {len(blocks)}\n\n"
-                "Please sit still and keep your eyes on the centre.\n"
-                "Try not to blink during the face sequences.\n\n"
-                "Press SPACE when you are ready.")
 
             for row in block_rows:
                 trial_global += 1
@@ -1344,15 +1367,20 @@ def main():
                           image_stims, trigger, fix_stim, prime_stim,
                           frame_counts, diode_stim)
 
-            if block_i < len(blocks):         # eyes-closed rest between blocks
+            if block_i < len(blocks):         # break between blocks (E-Prime S5)
                 show_text_and_wait(win, kb, instruction_text,
-                    "Rest period.\n\nYou may close your eyes and rest.\n\n"
-                    "Press SPACE when you are ready to continue.")
+                    "Now you can rest.\n\n"
+                    "Please try not to move your head.\n\n"
+                    "When you are ready to continue press with your index finger",
+                    min_wait=INSTRUCTION_MIN_WAIT)
 
-        # --- end screen ------------------------------------------------------
+        # --- end screen (E-Prime S6); only the experimenter's E key exits ----
         show_text_and_wait(win, kb, instruction_text,
-            "The experiment is complete.\n\nThank you.\n\n"
-            "Press SPACE to exit.")
+            "Thank you!!!\n\n"
+            "We have finished this part of the experiment.\n\n"
+            "Please close your eyes and rest for a while.",
+            allowed_keys=(END_SCREEN_KEY,),
+            min_wait=INSTRUCTION_MIN_WAIT)
     except KeyboardInterrupt as e:
         run_exception = e
         logging.warning(f"Run ended early: {e}")
